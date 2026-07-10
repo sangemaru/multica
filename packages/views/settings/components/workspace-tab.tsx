@@ -25,6 +25,7 @@ import {
   workspaceListOptions,
 } from "@multica/core/workspace/queries";
 import { api } from "@multica/core/api";
+import { activeSpaceListOptions, spaceKeys } from "@multica/core/spaces/queries";
 import {
   paths,
   resolvePostAuthDestination,
@@ -34,6 +35,7 @@ import {
 import { setCurrentWorkspace } from "@multica/core/platform";
 import type { Workspace } from "@multica/core/types";
 import { AvatarUploadControl } from "../../common/avatar-upload-control";
+import { SpacePicker } from "../../spaces/components/space-picker";
 import { useNavigation } from "../../navigation";
 import { DeleteWorkspaceDialog } from "./delete-workspace-dialog";
 import { useT } from "../../i18n";
@@ -77,6 +79,10 @@ export function WorkspaceTab() {
   const wsId = workspace?.id;
   const { data: members = [], isFetched: membersFetched } = useQuery({
     ...memberListOptions(wsId ?? ""),
+    enabled: !!wsId,
+  });
+  const { data: spaces = [] } = useQuery({
+    ...activeSpaceListOptions(wsId ?? ""),
     enabled: !!wsId,
   });
   const qc = useQueryClient();
@@ -133,6 +139,9 @@ export function WorkspaceTab() {
   const [context, setContext] = useState(workspace?.context ?? "");
   const [slugSaveStatus, setSlugSaveStatus] =
     useState<SettingsSaveStatus>("idle");
+  const [defaultSpaceId, setDefaultSpaceId] = useState<string | null>(null);
+  const [defaultSpaceSaveStatus, setDefaultSpaceSaveStatus] =
+    useState<SettingsSaveStatus>("idle");
   const [actionId, setActionId] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     title: string;
@@ -169,6 +178,11 @@ export function WorkspaceTab() {
     setContext(workspace?.context ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on id only; see comment above
   }, [workspace?.id]);
+
+  const configuredDefaultSpaceId = spaces.find((space) => space.is_default)?.id ?? null;
+  useEffect(() => {
+    setDefaultSpaceId(configuredDefaultSpaceId);
+  }, [workspace?.id, configuredDefaultSpaceId]);
 
   const detailsDraft = useMemo(
     () => ({ name, description, context }),
@@ -228,6 +242,34 @@ export function WorkspaceTab() {
       });
     } catch (error) {
       setSlugSaveStatus("error");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t(($) => $.workspace.toast_save_failed),
+      );
+    }
+  };
+
+  const performDefaultSpaceSave = async (nextSpaceId: string) => {
+    if (!workspace) return;
+    setDefaultSpaceSaveStatus("saving");
+    try {
+      const updated = await api.updateWorkspace(workspace.id, {
+        default_space_id: nextSpaceId,
+      });
+      qc.setQueryData(workspaceKeys.list(), (old: Workspace[] | undefined) =>
+        old?.map((ws) => (ws.id === updated.id ? updated : ws)),
+      );
+      if (wsId) {
+        await qc.invalidateQueries({ queryKey: spaceKeys.all(wsId) });
+      }
+      setDefaultSpaceSaveStatus("saved");
+      toast.success(t(($) => $.workspace.toast_saved), {
+        id: "settings-auto-save",
+      });
+    } catch (error) {
+      setDefaultSpaceSaveStatus("error");
+      setDefaultSpaceId(configuredDefaultSpaceId);
       toast.error(
         error instanceof Error
           ? error.message
@@ -300,11 +342,15 @@ export function WorkspaceTab() {
         action={
           <SettingsSaveState
             status={
-              slugSaveStatus === "saving" || slugSaveStatus === "error"
-                ? slugSaveStatus
-                : detailsAutoSave.status === "idle"
+              defaultSpaceSaveStatus === "saving" || defaultSpaceSaveStatus === "error"
+                ? defaultSpaceSaveStatus
+                : slugSaveStatus === "saving" || slugSaveStatus === "error"
                   ? slugSaveStatus
-                  : detailsAutoSave.status
+                  : detailsAutoSave.status !== "idle"
+                    ? detailsAutoSave.status
+                    : slugSaveStatus !== "idle"
+                      ? slugSaveStatus
+                      : defaultSpaceSaveStatus
             }
             savingLabel={t(($) => $.auto_save.saving)}
             savedLabel={t(($) => $.auto_save.saved)}
@@ -406,6 +452,25 @@ export function WorkspaceTab() {
           </SettingsRow>
 
           <SettingsRow
+            label={t(($) => $.workspace.default_space_label)}
+            description={t(($) => $.workspace.default_space_hint)}
+            controlClassName="sm:w-80"
+          >
+            <div className="flex h-9 items-center sm:justify-end">
+              <SpacePicker
+                spaceId={defaultSpaceId}
+                onChange={(nextSpaceId) => {
+                  if (nextSpaceId === defaultSpaceId) return;
+                  setDefaultSpaceId(nextSpaceId);
+                  void performDefaultSpaceSave(nextSpaceId);
+                }}
+                disabled={!canManageWorkspace}
+                filter={(space) => space.visibility === "open"}
+              />
+            </div>
+          </SettingsRow>
+
+          <SettingsRow
             label={t(($) => $.workspace.slug_label)}
             description={t(($) => $.workspace.slug_hint)}
             controlClassName="sm:w-80"
@@ -430,11 +495,11 @@ export function WorkspaceTab() {
             />
           </SettingsRow>
 
-            {!canManageWorkspace && (
-              <div className="px-4 py-3 text-xs text-muted-foreground">
-                {t(($) => $.workspace.manage_hint)}
-              </div>
-            )}
+          {!canManageWorkspace && (
+            <div className="px-4 py-3 text-xs text-muted-foreground">
+              {t(($) => $.workspace.manage_hint)}
+            </div>
+          )}
         </SettingsCard>
       </SettingsSection>
 
