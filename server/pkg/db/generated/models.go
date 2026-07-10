@@ -48,11 +48,11 @@ type Agent struct {
 	ComposioToolkitAllowlist []string `json:"composio_toolkit_allowlist"`
 	// Agent invocation permission mode (MUL-3963). private = owner only; public_to = allow-list in agent_invocation_target. Replaces visibility as the authorization source for triggering runs; visibility is now a derived legacy field. Default private = deny-by-default.
 	PermissionMode string `json:"permission_mode"`
-	// Location availability gate. private = owner only in any active Space they can use; selected_spaces = only rows in agent_available_space; workspace = every active Space. Independent of invocation audience and grants no data access.
+	// Space assignment. private = owner only in a concrete active Space they can use; selected_spaces = only rows in agent_available_space; workspace = every active Space. Each run is still bound to exactly one Space.
 	AvailabilityMode string `json:"availability_mode"`
 }
 
-// Selected-Space location grants for agents with availability_mode=selected_spaces. These rows only permit invocation in a Space context; they grant no read/write access to Space data, integrations, or resources.
+// Selected-Space assignments for agents with availability_mode=selected_spaces. A run may receive read/write access to its one bound Space only.
 type AgentAvailableSpace struct {
 	AgentID     pgtype.UUID        `json:"agent_id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
@@ -860,6 +860,8 @@ type TaskToken struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	// The single Space data boundary for this run. NULL means the task has no Space data access.
+	SpaceID pgtype.UUID `json:"space_id"`
 }
 
 type TaskUsage struct {
