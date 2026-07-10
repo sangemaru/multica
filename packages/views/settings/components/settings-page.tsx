@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import {
   Bell,
   FolderGit2,
@@ -11,6 +11,7 @@ import {
   SlidersHorizontal,
   User,
   Users,
+  Workflow,
 } from "lucide-react";
 import { cn } from "@multica/ui/lib/utils";
 import {
@@ -34,6 +35,7 @@ import { RepositoriesTab } from "./repositories-tab";
 import { IntegrationsTab } from "./integrations-tab";
 import { NotificationsTab } from "./notifications-tab";
 import { WorkspaceSpacesTab } from "./workspace-spaces-tab";
+import { AutopilotTemplatesTab } from "./autopilot-templates-tab";
 import { useT } from "../../i18n";
 
 type SettingsScope = "account" | "workspace" | "device";
@@ -147,6 +149,13 @@ export function SettingsPage({ extraDeviceTabs }: SettingsPageProps = {}) {
       },
       {
         scope: "workspace",
+        key: "autopilot-templates",
+        label: t(($) => $.page.tabs.autopilot_templates),
+        icon: Workflow,
+        content: <AutopilotTemplatesTab />,
+      },
+      {
+        scope: "workspace",
         key: "integrations",
         label: t(($) => $.page.tabs.integrations),
         icon: Plug,
@@ -191,13 +200,26 @@ export function SettingsPage({ extraDeviceTabs }: SettingsPageProps = {}) {
   const active =
     (requestedPath ? destinationByPath.get(requestedPath) : null) ?? groups.account[0]!;
   const activePath = `${active.scope}/${active.key}`;
+  const canonicalPath =
+    suffix === activePath && legacyTab === null
+      ? null
+      : paths.settingsSection(active.scope, active.key);
+  const lastRequestedCanonicalPath = useRef<string | null>(null);
 
   // Canonicalise old query-tab bookmarks and unknown/root Settings URLs. This
   // keeps one stable URL per page while preserving every legacy entry point.
+  // The navigation adapter may re-render while a route transition is pending;
+  // remember the in-flight target so that render cannot enqueue the same
+  // replace repeatedly before the pathname commits.
   useEffect(() => {
-    if (suffix === activePath && legacyTab === null) return;
-    navigation.replace(paths.settingsSection(active.scope, active.key));
-  }, [active.key, active.scope, activePath, legacyTab, navigation, paths, suffix]);
+    if (canonicalPath === null) {
+      lastRequestedCanonicalPath.current = null;
+      return;
+    }
+    if (lastRequestedCanonicalPath.current === canonicalPath) return;
+    lastRequestedCanonicalPath.current = canonicalPath;
+    navigation.replace(canonicalPath);
+  }, [canonicalPath, navigation]);
 
   const selectDestination = (path: string | null) => {
     if (!path) return;

@@ -18,6 +18,7 @@ import {
   SpaceIssuesRoute,
   SpaceProjectsRoute,
   SpaceAutopilotsRoute,
+  SpaceSquadsRoute,
   SpaceDetailRoute,
   SpaceSettingsRoute,
 } from "./pages/space-surface-pages";
@@ -174,6 +175,16 @@ export const appRoutes: RouteObject[] = [
             path: "space/:spaceKey/autopilots",
             element: <SpaceAutopilotsRoute />,
             handle: { title: "Space autopilots" },
+          },
+          {
+            path: "space/:spaceKey/squads",
+            element: <SpaceSquadsRoute />,
+            handle: { title: "Space squads" },
+          },
+          {
+            path: "space/:spaceKey/squads/:id",
+            element: <SquadDetailPageView />,
+            handle: { title: "Squad" },
           },
           {
             path: "space/:spaceKey/settings",
