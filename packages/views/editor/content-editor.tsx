@@ -139,6 +139,11 @@ interface ContentEditorProps {
   /** Chat can surface current/recent issue/project suggestions. Other editors use default mention behavior. */
   mentionMode?: "default" | "context";
   mentionContextItems?: MentionItem[];
+  /**
+   * Concrete Space for an Issue/Create target. Agent @mentions are filtered
+   * against this location. Pass `null` for explicitly context-free surfaces.
+   */
+  targetSpaceId?: string | null;
   /** Enable the `/` command picker. Defaults false. */
   enableSlashCommands?: boolean;
   /**
@@ -203,6 +208,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       disableMentions = false,
       mentionMode = "default",
       mentionContextItems,
+      targetSpaceId,
       enableSlashCommands = false,
       slashCommandMode = "skill",
       attachments,
@@ -223,6 +229,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       ((file: File) => Promise<UploadResult | null>) | undefined
     >(undefined);
     const mentionContextItemsRef = useRef<MentionItem[]>(mentionContextItems ?? []);
+    const targetSpaceIdRef = useRef<string | null | undefined>(targetSpaceId);
     const lastEmittedRef = useRef<string | null>(null);
     // Live placeholder text. Passed into the Placeholder extension as a getter
     // (not a static string) so the plugin re-reads it on every decoration pass —
@@ -304,6 +311,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     onBlurRef.current = onBlur;
     onUploadFileRef.current = wrappedOnUploadFile;
     mentionContextItemsRef.current = mentionContextItems ?? [];
+    targetSpaceIdRef.current = targetSpaceId;
     flushPendingOnUnmountRef.current = flushPendingOnUnmount;
 
     const queryClient = useQueryClient();
@@ -395,6 +403,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         disableMentions,
         mentionMode,
         getMentionContextItems: () => mentionContextItemsRef.current,
+        getMentionTargetSpaceId: () => targetSpaceIdRef.current,
         enableSlashCommands,
         slashCommandMode,
         resolveIssueIdentifierRef,

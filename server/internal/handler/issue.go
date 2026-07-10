@@ -2018,25 +2018,8 @@ func (h *Handler) QuickCreateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Reuse the same workspace-membership / archived / private-agent
-	// ownership rules as `validateAssigneePair` so a user can't POST a
-	// private agent_id they shouldn't be able to dispatch (the frontend
-	// filters them out, but the handler is the trust boundary). Squad
-	// picks reach this with the resolved leader agent; the same rules
-	// apply — a private leader behind a squad the user can't reach
-	// should still be rejected.
-	if status, msg := h.validateAssigneePair(
-		r.Context(), r, workspaceID,
-		pgtype.Text{String: "agent", Valid: true},
-		agentUUID,
-	); status != 0 {
-		writeError(w, status, msg)
-		return
-	}
-
-	// Re-load the agent for the runtime liveness check below. Safe by
-	// construction: validateAssigneePair just confirmed it exists in this
-	// workspace and the caller has visibility.
+	// Load the agent for the runtime liveness check below. The Space-aware
+	// invocation gate runs after the final target Space is resolved.
 	agent, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
 		ID:          agentUUID,
 		WorkspaceID: wsUUID,
@@ -2142,6 +2125,15 @@ func (h *Handler) QuickCreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.requireSpaceCollaboration(w, r, wsUUID, space.ID) {
+		return
+	}
+	// Reuse the canonical assignment gate only after the final Space is known;
+	// Selected Spaces must match the actual async-created Issue location.
+	if status, msg := h.validateAssigneePair(
+		r.Context(), r, workspaceID,
+		pgtype.Text{String: "agent", Valid: true}, agentUUID, space.ID,
+	); status != 0 {
+		writeError(w, status, msg)
 		return
 	}
 
@@ -2328,11 +2320,6 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		assigneeID = id
 	}
 
-	if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, assigneeType, assigneeID); status != 0 {
-		writeError(w, status, msg)
-		return
-	}
-
 	var parentIssueID pgtype.UUID
 	var projectID pgtype.UUID
 	var spaceID pgtype.UUID
@@ -2387,6 +2374,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		accessSpaceID = defaultSpace.ID
 	}
 	if !h.requireSpaceCollaboration(w, r, wsUUID, accessSpaceID) {
+		return
+	}
+	if status, msg := h.validateAssigneePair(
+		r.Context(), r, workspaceID, assigneeType, assigneeID, accessSpaceID,
+	); status != 0 {
+		writeError(w, status, msg)
 		return
 	}
 	// Cross-workspace parent / project existence is enforced inside
@@ -2780,7 +2773,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	_, touchedType := rawFields["assignee_type"]
 	_, touchedID := rawFields["assignee_id"]
 	if touchedType || touchedID {
-		if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID); status != 0 {
+		if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, prevIssue.SpaceID); status != 0 {
 			writeError(w, status, msg)
 			return
 		}
@@ -2947,7 +2940,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			AssigneeChanged: assigneeChanged,
 			StatusChanged:   statusChanged,
 		},
-		h.issueTriggerWriteProbe(r, actorType, issue),
+		h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 	); ok && !req.SuppressRun {
 		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote)
 	}
@@ -2981,7 +2974,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 // Returns (statusCode, errorMessage). statusCode == 0 means the pair is valid;
 // callers should treat any non-zero status as a rejection and surface it back
 // to the client.
-func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, workspaceID string, assigneeType pgtype.Text, assigneeID pgtype.UUID) (int, string) {
+func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, workspaceID string, assigneeType pgtype.Text, assigneeID, targetSpaceID pgtype.UUID) (int, string) {
 	// Both unset → unassigned issue, valid.
 	if !assigneeType.Valid && !assigneeID.Valid {
 		return 0, ""
@@ -3015,8 +3008,8 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 			return http.StatusBadRequest, "cannot assign to archived agent"
 		}
 		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
-		if !h.canInvokeAgent(ctx, agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
-			return http.StatusForbidden, "cannot assign to private agent"
+		if !h.canInvokeAgent(ctx, agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID, targetSpaceID) {
+			return http.StatusForbidden, "agent is not available in this Space"
 		}
 		return 0, ""
 	case "squad":
@@ -3035,8 +3028,8 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 			return http.StatusBadRequest, "squad leader is archived; cannot assign to this squad"
 		}
 		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
-		if !h.canInvokeAgent(ctx, leader, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
-			return http.StatusForbidden, "cannot assign to squad with private leader"
+		if !h.canInvokeAgent(ctx, leader, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID, targetSpaceID) {
+			return http.StatusForbidden, "squad leader is not available in this Space"
 		}
 		return 0, ""
 	default:
@@ -3079,7 +3072,7 @@ func (h *Handler) assigneeFallbackAgent(ctx context.Context, issue db.Issue, act
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
 		return db.Agent{}, false, false
 	}
-	if !h.canInvokeAgent(ctx, agent, actorType, actorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID)) {
+	if !h.canInvokeAgent(ctx, agent, actorType, actorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID), issue.SpaceID) {
 		return db.Agent{}, false, false
 	}
 	// Coalescing queue: pending is still a valid route target, but callers
@@ -3425,7 +3418,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		_, batchTouchedType := rawUpdates["assignee_type"]
 		_, batchTouchedID := rawUpdates["assignee_id"]
 		if batchTouchedType || batchTouchedID {
-			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID); status != 0 {
+			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID, prevIssue.SpaceID); status != 0 {
 				continue
 			}
 		}
@@ -3467,7 +3460,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 				AssigneeChanged: assigneeChanged,
 				StatusChanged:   statusChanged,
 			},
-			h.issueTriggerWriteProbe(r, actorType, issue),
+			h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 		); ok && !req.Updates.SuppressRun {
 			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
 		}
