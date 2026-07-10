@@ -25,7 +25,6 @@ import {
   workspaceListOptions,
 } from "@multica/core/workspace/queries";
 import { api } from "@multica/core/api";
-import { activeSpaceListOptions, spaceKeys } from "@multica/core/spaces/queries";
 import {
   paths,
   resolvePostAuthDestination,
@@ -35,7 +34,6 @@ import {
 import { setCurrentWorkspace } from "@multica/core/platform";
 import type { Workspace } from "@multica/core/types";
 import { AvatarUploadControl } from "../../common/avatar-upload-control";
-import { SpacePicker } from "../../spaces/components/space-picker";
 import { useNavigation } from "../../navigation";
 import { DeleteWorkspaceDialog } from "./delete-workspace-dialog";
 import { useT } from "../../i18n";
@@ -79,10 +77,6 @@ export function WorkspaceTab() {
   const wsId = workspace?.id;
   const { data: members = [], isFetched: membersFetched } = useQuery({
     ...memberListOptions(wsId ?? ""),
-    enabled: !!wsId,
-  });
-  const { data: spaces = [] } = useQuery({
-    ...activeSpaceListOptions(wsId ?? ""),
     enabled: !!wsId,
   });
   const qc = useQueryClient();
@@ -235,7 +229,9 @@ export function WorkspaceTab() {
         old?.map((ws) => (ws.id === updated.id ? updated : ws)),
       );
       setCurrentWorkspace(updated.slug, updated.id);
-      navigation.replace(paths.workspace(updated.slug).settings());
+      navigation.replace(
+        paths.workspace(updated.slug).settingsSection("workspace", "general"),
+      );
       setSlugSaveStatus("saved");
       toast.success(t(($) => $.workspace.toast_saved), {
         id: "settings-auto-save",

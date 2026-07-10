@@ -19,6 +19,7 @@ import {
   SpaceProjectsRoute,
   SpaceAutopilotsRoute,
   SpaceDetailRoute,
+  SpaceSettingsRoute,
 } from "./pages/space-surface-pages";
 import { CreateSpacePage } from "@multica/views/spaces";
 import { IssuesPage } from "@multica/views/issues/components";
@@ -49,7 +50,7 @@ function DesktopSettingsRoute() {
   const { t } = useT("settings");
   return (
     <SettingsPage
-      extraAccountTabs={[
+      extraDeviceTabs={[
         {
           value: "daemon",
           label: "Daemon",
@@ -170,6 +171,11 @@ export const appRoutes: RouteObject[] = [
             handle: { title: "Space autopilots" },
           },
           {
+            path: "space/:spaceKey/settings",
+            element: <SpaceSettingsRoute />,
+            handle: { title: "Space settings" },
+          },
+          {
             path: "space/:spaceKey",
             element: <SpaceDetailRoute />,
             handle: { title: "Space detail" },
@@ -240,7 +246,7 @@ export const appRoutes: RouteObject[] = [
             handle: { title: "Usage" },
           },
           {
-            path: "settings",
+            path: "settings/*",
             element: <DesktopSettingsRoute />,
             handle: { title: "Settings" },
           },
