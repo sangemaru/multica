@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   useInfiniteQuery,
   useQuery,
@@ -14,6 +14,8 @@ import { agentListOptions, memberListOptions } from "@multica/core/workspace/que
 import { canAssignAgent } from "@multica/views/issues/components";
 import { api } from "@multica/core/api";
 import { useAgentPresenceDetail, useWorkspaceAgentAvailability } from "@multica/core/agents";
+import { chatSpacesForAgent, defaultChatSpaceId } from "@multica/core/chat";
+import { activeSpaceListOptions } from "@multica/core/spaces";
 import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import {
   chatSessionsOptions,
@@ -202,9 +204,12 @@ export function useChatController(opts?: { isActive?: boolean }) {
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
   const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
+  const newSessionSpaceId = useChatStore((s) => s.newSessionSpaceId);
+  const setNewSessionSpaceId = useChatStore((s) => s.setNewSessionSpaceId);
   const user = useAuthStore((s) => s.user);
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
+  const { data: spaces = [] } = useQuery(activeSpaceListOptions(wsId));
   const { data: sessions = [], isSuccess: sessionsLoaded } = useQuery(
     chatSessionsOptions(wsId),
   );
@@ -263,7 +268,10 @@ export function useChatController(opts?: { isActive?: boolean }) {
   const currentMember = members.find((m) => m.user_id === user?.id);
   const memberRole = currentMember?.role;
   const availableAgents = agents.filter(
-    (a) => !a.archived_at && canAssignAgent(a, user?.id, memberRole, null),
+    (a) =>
+      !a.archived_at &&
+      canAssignAgent(a, user?.id, memberRole) &&
+      chatSpacesForAgent(a, spaces, user?.id, memberRole).length > 0,
   );
 
   // The agent bound to the OPEN session, resolved from the full agent list
@@ -287,8 +295,19 @@ export function useChatController(opts?: { isActive?: boolean }) {
     availableAgents[0] ??
     null;
 
+  const availableSpaces = useMemo(
+    () =>
+      activeAgent ? chatSpacesForAgent(activeAgent, spaces, user?.id, memberRole) : [],
+    [activeAgent, spaces, user?.id, memberRole],
+  );
+  const activeSpaceId = currentSession
+    ? (currentSession.space_id ?? null)
+    : newSessionSpaceId;
+
   const agentAvailability = useWorkspaceAgentAvailability();
-  const noAgent = agentAvailability === "none";
+  const noAgent =
+    agentAvailability === "none" ||
+    (agentAvailability === "available" && availableAgents.length === 0);
 
   const presenceDetail = useAgentPresenceDetail(wsId, activeAgent?.id);
   const availability =
@@ -333,6 +352,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
           const session = await createSession.mutateAsync({
             agent_id: activeAgent.id,
             title: deriveChatTitle(titleSeed),
+            space_id: newSessionSpaceId,
           });
           return session.id;
         } finally {
@@ -342,7 +362,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
       sessionPromiseRef.current = promise;
       return promise;
     },
-    [activeSessionId, activeAgent, createSession, sessions, sessionsLoaded, qc],
+    [activeSessionId, activeAgent, createSession, sessions, sessionsLoaded, qc, newSessionSpaceId],
   );
 
   // Self-heal a dangling `activeSessionId`. Once the sessions list has loaded
@@ -583,8 +603,9 @@ export function useChatController(opts?: { isActive?: boolean }) {
       previousPendingTask: pendingTaskId,
     });
     setActiveSession(null);
+    setNewSessionSpaceId(defaultChatSpaceId(availableSpaces));
     requestInputFocus();
-  }, [activeSessionId, pendingTaskId, setActiveSession, requestInputFocus]);
+  }, [activeSessionId, pendingTaskId, setActiveSession, setNewSessionSpaceId, availableSpaces, requestInputFocus]);
 
   // Start a fresh chat bound to a chosen agent. Unlike handleSelectAgent this
   // does not no-op when the agent is unchanged — "new chat" always clears the
@@ -597,10 +618,13 @@ export function useChatController(opts?: { isActive?: boolean }) {
         previousSessionId: activeSessionId,
       });
       setSelectedAgentId(agent.id);
+      setNewSessionSpaceId(
+        defaultChatSpaceId(chatSpacesForAgent(agent, spaces, user?.id, memberRole)),
+      );
       setActiveSession(null);
       requestInputFocus();
     },
-    [activeSessionId, setSelectedAgentId, setActiveSession, requestInputFocus],
+    [activeSessionId, setSelectedAgentId, setNewSessionSpaceId, spaces, user?.id, memberRole, setActiveSession, requestInputFocus],
   );
 
   const handleSelectSession = useCallback(
@@ -654,7 +678,10 @@ export function useChatController(opts?: { isActive?: boolean }) {
     wsId,
     user,
     agents,
+    spaces,
     availableAgents,
+    availableSpaces,
+    activeSpaceId,
     sessions,
     activeSessionId,
     selectedAgentId,
@@ -691,6 +718,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
     // store setters (for surfaces that sync selection to the URL, etc.)
     setActiveSession,
     setSelectedAgentId,
+    setNewSessionSpaceId,
   };
 }
 

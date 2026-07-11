@@ -3,6 +3,14 @@
     "title": "チャット",
     "select_prompt": "会話を選ぶか、＋ で新規作成してください"
   },
+  "context": {
+    "scope_label": "コンテキスト",
+    "spaces_label": "スペース",
+    "all_spaces": "すべてのスペース",
+    "all_spaces_description": "{{count}} 個のスペースのデータを使用できます",
+    "search_spaces": "スペースを検索…",
+    "picker_aria": "チャットのコンテキスト：{{selection}}"
+  },
   "fab": {
     "running": "Multica が作業中です...",
     "unread_other": "未読のチャット {{count}}件",
