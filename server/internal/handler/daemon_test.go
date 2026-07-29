@@ -109,6 +109,11 @@ func setHandlerTestWorkspaceRepos(t *testing.T, repos []map[string]string) {
 // newDaemonTokenRequest creates an HTTP request with daemon token context set
 // (simulating DaemonAuth middleware for mdt_ tokens).
 func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID string) *http.Request {
+	if strings.Contains(path, "/tasks/claim") || strings.HasSuffix(path, "/claim") {
+		if err := authorizeHandlerClaimFixtures(context.Background(), workspaceID); err != nil {
+			panic("authorize handler claim fixtures: " + err.Error())
+		}
+	}
 	var buf bytes.Buffer
 	if body != nil {
 		json.NewEncoder(&buf).Encode(body)

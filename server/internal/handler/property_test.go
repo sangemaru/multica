@@ -222,8 +222,7 @@ func TestPropertyAdminGate(t *testing.T) {
 	// Agent actor (task_token path is trusted directly by resolveActor).
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/properties", map[string]any{"name": "AgentMade", "type": "text"})
-	req.Header.Set("X-Actor-Source", "task_token")
-	req.Header.Set("X-Agent-ID", uuid.NewString())
+	req = withAgentTaskIdentity(req, uuid.NewString(), uuid.NewString())
 	testHandler.CreateProperty(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("agent CreateProperty: expected 403, got %d: %s", w.Code, w.Body.String())
@@ -234,8 +233,7 @@ func TestPropertyAdminGate(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+issueID+"/properties/"+property.ID, map[string]any{"value": "set by agent"})
-	req.Header.Set("X-Actor-Source", "task_token")
-	req.Header.Set("X-Agent-ID", uuid.NewString())
+	req = withAgentTaskIdentity(req, uuid.NewString(), uuid.NewString())
 	req = withIssuePropertyParams(req, issueID, property.ID)
 	testHandler.SetIssueProperty(w, req)
 	if w.Code != http.StatusOK {

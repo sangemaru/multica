@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS authorization_budget_event_lineage_idx;

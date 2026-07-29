@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -78,6 +80,26 @@ func TestAuth_MissingHeader(t *testing.T) {
 	}
 	if body := w.Body.String(); body != `{"error":"missing authorization"}`+"\n" {
 		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestAuth_LegacyJWTIncludesAuthorizationExchangeGuidance(t *testing.T) {
+	token := generateToken(validClaims(), auth.JWTSecret())
+	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/issues", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if got := w.Header().Get("X-Multica-Authorization-Exchange"); got != "/api/authorization/sessions/exchange" {
+		t.Fatalf("exchange guidance=%q", got)
+	}
+	if got := w.Header().Get("Warning"); !strings.Contains(got, "Legacy credential") {
+		t.Fatalf("warning=%q", got)
 	}
 }
 
@@ -172,9 +194,11 @@ func TestAuth_WrongSigningMethod(t *testing.T) {
 
 func TestAuth_ValidToken(t *testing.T) {
 	var gotUserID, gotEmail string
+	var gotIdentity requestidentity.RequestIdentity
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUserID = r.Header.Get("X-User-ID")
 		gotEmail = r.Header.Get("X-User-Email")
+		gotIdentity, _ = requestidentity.FromContext(r.Context())
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -193,6 +217,11 @@ func TestAuth_ValidToken(t *testing.T) {
 	}
 	if gotEmail != "test@multica.ai" {
 		t.Fatalf("expected X-User-Email 'test@multica.ai', got '%s'", gotEmail)
+	}
+	if gotIdentity.PrincipalType != requestidentity.PrincipalMember ||
+		gotIdentity.CredentialClass != requestidentity.CredentialLegacyHumanSession ||
+		gotIdentity.UserID != "test-user-id" {
+		t.Fatalf("server identity = %+v, want member legacy-human session", gotIdentity)
 	}
 }
 
@@ -239,11 +268,11 @@ func TestAuth_InvalidPAT(t *testing.T) {
 // `X-Actor-Source: task_token` (or any other value) to fool a handler
 // into treating the request differently — exactly the kind of trust
 // boundary MUL-2600 introduces.
-func TestAuth_StripsClientSuppliedActorSource(t *testing.T) {
-	var gotActorSource string
+func TestAuth_StripsClientSuppliedIdentityHeaders(t *testing.T) {
+	got := make(http.Header)
 	mw := Auth(nil, nil, nil)
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotActorSource = r.Header.Get("X-Actor-Source")
+		got = r.Header.Clone()
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -254,14 +283,21 @@ func TestAuth_StripsClientSuppliedActorSource(t *testing.T) {
 	// discard it before the JWT branch runs (which doesn't set it again
 	// for human sessions).
 	req.Header.Set("X-Actor-Source", "task_token")
+	req.Header.Set("X-Agent-ID", "forged-agent")
+	req.Header.Set("X-Task-ID", "forged-task")
+	req.Header.Set("X-User-ID", "forged-user")
+	req.Header.Set("X-User-Email", "forged@example.test")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if gotActorSource != "" {
-		t.Fatalf("X-Actor-Source must be cleared on non-task-token paths, got %q", gotActorSource)
+	if got.Get("X-Actor-Source") != "" || got.Get("X-Agent-ID") != "" || got.Get("X-Task-ID") != "" {
+		t.Fatalf("client identity headers survived authentication: %+v", got)
+	}
+	if got.Get("X-User-ID") != "test-user-id" || got.Get("X-User-Email") != "test@multica.ai" {
+		t.Fatalf("authenticated member headers were not server-derived: %+v", got)
 	}
 }
 

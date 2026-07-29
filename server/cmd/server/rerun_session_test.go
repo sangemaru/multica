@@ -76,6 +76,70 @@ func cleanupRerunFixture(t *testing.T, issueID string) {
 	testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
 }
 
+// authorizeRerunSourceTaskFixture gives a terminal task the immutable
+// authorization lineage that every production-created task receives through
+// TaskService. Migration 207 did the same for tasks that predated rollout;
+// direct post-migration test inserts must opt in explicitly so production can
+// continue to reject an unlineaged parent fail-closed.
+func authorizeRerunSourceTaskFixture(t *testing.T, taskID string) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `
+		WITH source AS (
+			SELECT
+				t.id AS task_id,
+				t.agent_id,
+				t.issue_id,
+				a.workspace_id,
+				i.project_id,
+				gen_random_uuid() AS lineage_id
+			FROM agent_task_queue t
+			JOIN agent a ON a.id = t.agent_id
+			LEFT JOIN issue i ON i.id = t.issue_id
+			WHERE t.id = $1
+		), decision AS (
+			INSERT INTO authorization_decision (
+				id, path, action, principal_type, principal_id, credential_class,
+				workspace_id, project_id, issue_id, agent_id,
+				allowed, reason_code, policy_version, observe_only, lineage_id
+			)
+			SELECT
+				s.task_id, 'test_rerun_source', 'agent:invoke', 'agent', s.agent_id,
+				'agent_task_token', s.workspace_id, s.project_id, s.issue_id, s.agent_id,
+				TRUE, 'test_fixture_compatibility_allow', 'observe-v1', FALSE, s.lineage_id
+			FROM source s
+			RETURNING id, policy_version, lineage_id, workspace_id
+		), budget AS (
+			INSERT INTO authorization_lineage_budget (
+				lineage_id, workspace_id, execution_limit, consumed_executions
+			)
+			SELECT lineage_id, workspace_id, 64, 1
+			FROM decision
+			RETURNING lineage_id
+		), reservation AS (
+			INSERT INTO authorization_budget_reservation (
+				lineage_id, admission_decision_id, generation, status, task_id,
+				expires_at, consumed_at
+			)
+			SELECT
+				d.lineage_id, d.id, 1, 'consumed', d.id,
+				now() + interval '100 years', now()
+			FROM decision d
+			JOIN budget b ON b.lineage_id = d.lineage_id
+			RETURNING id, admission_decision_id, lineage_id
+		)
+		UPDATE agent_task_queue t
+		SET admission_decision_id = d.id,
+			authorization_policy_version = d.policy_version,
+			lineage_id = d.lineage_id,
+			budget_reservation_id = r.id
+		FROM decision d
+		JOIN reservation r ON r.admission_decision_id = d.id
+		WHERE t.id = d.id
+	`, taskID); err != nil {
+		t.Fatalf("authorize rerun source task fixture: %v", err)
+	}
+}
+
 // TestGetLastTaskSessionExcludesPoisonedFailures asserts that the
 // (agent_id, issue_id) resume lookup skips failed tasks whose
 // failure_reason classifies them as poisoned terminal output. This is the
@@ -740,6 +804,7 @@ func TestRerunIssueTargetsSourceTaskAgent(t *testing.T) {
 	`, secondaryAgentID, runtimeID, issueID).Scan(&sourceTaskID); err != nil {
 		t.Fatalf("insert source task: %v", err)
 	}
+	authorizeRerunSourceTaskFixture(t, sourceTaskID)
 
 	queries := db.New(testPool)
 	hub := realtime.NewHub()
@@ -878,6 +943,7 @@ func TestRerunIssueInheritsTriggerCommentFromSourceTask(t *testing.T) {
 	`, agentID, runtimeID, issueID, triggerCommentID).Scan(&sourceTaskID); err != nil {
 		t.Fatalf("insert source task: %v", err)
 	}
+	authorizeRerunSourceTaskFixture(t, sourceTaskID)
 
 	queries := db.New(testPool)
 	hub := realtime.NewHub()

@@ -27,8 +27,7 @@ func TestCreateComment_TriggeredTaskRejectsTopLevelComment(t *testing.T) {
 		"content": "dispatching a squad from this task",
 	})
 	r = withURLParam(r, "id", fx.IssueID)
-	r.Header.Set("X-Agent-ID", fx.LeaderID)
-	r.Header.Set("X-Task-ID", fx.TaskID)
+	r = withAgentTaskIdentity(r, fx.LeaderID, fx.TaskID)
 
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusConflict {
@@ -74,8 +73,7 @@ func TestCreateComment_TriggeredTaskAllowsReplyUnderTrigger(t *testing.T) {
 		"parent_id": fx.TriggerCommentID,
 	})
 	r = withURLParam(r, "id", fx.IssueID)
-	r.Header.Set("X-Agent-ID", fx.LeaderID)
-	r.Header.Set("X-Task-ID", fx.TaskID)
+	r = withAgentTaskIdentity(r, fx.LeaderID, fx.TaskID)
 
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {

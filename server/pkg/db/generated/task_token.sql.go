@@ -12,18 +12,37 @@ import (
 )
 
 const createTaskToken = `-- name: CreateTaskToken :one
-INSERT INTO task_token (token_hash, task_id, agent_id, workspace_id, user_id, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, token_hash, task_id, agent_id, workspace_id, user_id, expires_at, created_at
+INSERT INTO task_token (
+    token_hash, task_id, agent_id, workspace_id, user_id, expires_at,
+    project_id, issue_id, lineage_id, authorization_session_id,
+    allowed_actions, explicit_denies, delegation_depth_remaining,
+    allowed_child_principal_ids, capability_envelope
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11, $12, $13,
+    $14, $15
+)
+RETURNING id, token_hash, task_id, agent_id, workspace_id, user_id, expires_at, created_at, project_id, issue_id, lineage_id, authorization_session_id, allowed_actions, explicit_denies, delegation_depth_remaining, allowed_child_principal_ids, capability_envelope
 `
 
 type CreateTaskTokenParams struct {
-	TokenHash   string             `json:"token_hash"`
-	TaskID      pgtype.UUID        `json:"task_id"`
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	UserID      pgtype.UUID        `json:"user_id"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	TokenHash                string             `json:"token_hash"`
+	TaskID                   pgtype.UUID        `json:"task_id"`
+	AgentID                  pgtype.UUID        `json:"agent_id"`
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	UserID                   pgtype.UUID        `json:"user_id"`
+	ExpiresAt                pgtype.Timestamptz `json:"expires_at"`
+	ProjectID                pgtype.UUID        `json:"project_id"`
+	IssueID                  pgtype.UUID        `json:"issue_id"`
+	LineageID                pgtype.UUID        `json:"lineage_id"`
+	AuthorizationSessionID   pgtype.UUID        `json:"authorization_session_id"`
+	AllowedActions           []string           `json:"allowed_actions"`
+	ExplicitDenies           []string           `json:"explicit_denies"`
+	DelegationDepthRemaining pgtype.Int4        `json:"delegation_depth_remaining"`
+	AllowedChildPrincipalIds []pgtype.UUID      `json:"allowed_child_principal_ids"`
+	CapabilityEnvelope       bool               `json:"capability_envelope"`
 }
 
 func (q *Queries) CreateTaskToken(ctx context.Context, arg CreateTaskTokenParams) (TaskToken, error) {
@@ -34,6 +53,15 @@ func (q *Queries) CreateTaskToken(ctx context.Context, arg CreateTaskTokenParams
 		arg.WorkspaceID,
 		arg.UserID,
 		arg.ExpiresAt,
+		arg.ProjectID,
+		arg.IssueID,
+		arg.LineageID,
+		arg.AuthorizationSessionID,
+		arg.AllowedActions,
+		arg.ExplicitDenies,
+		arg.DelegationDepthRemaining,
+		arg.AllowedChildPrincipalIds,
+		arg.CapabilityEnvelope,
 	)
 	var i TaskToken
 	err := row.Scan(
@@ -45,6 +73,15 @@ func (q *Queries) CreateTaskToken(ctx context.Context, arg CreateTaskTokenParams
 		&i.UserID,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.ProjectID,
+		&i.IssueID,
+		&i.LineageID,
+		&i.AuthorizationSessionID,
+		&i.AllowedActions,
+		&i.ExplicitDenies,
+		&i.DelegationDepthRemaining,
+		&i.AllowedChildPrincipalIds,
+		&i.CapabilityEnvelope,
 	)
 	return i, err
 }
@@ -68,7 +105,7 @@ func (q *Queries) DeleteTaskTokensByTask(ctx context.Context, taskID pgtype.UUID
 }
 
 const getTaskTokenByHash = `-- name: GetTaskTokenByHash :one
-SELECT id, token_hash, task_id, agent_id, workspace_id, user_id, expires_at, created_at FROM task_token
+SELECT id, token_hash, task_id, agent_id, workspace_id, user_id, expires_at, created_at, project_id, issue_id, lineage_id, authorization_session_id, allowed_actions, explicit_denies, delegation_depth_remaining, allowed_child_principal_ids, capability_envelope FROM task_token
 WHERE token_hash = $1 AND expires_at > now()
 `
 
@@ -84,6 +121,15 @@ func (q *Queries) GetTaskTokenByHash(ctx context.Context, tokenHash string) (Tas
 		&i.UserID,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.ProjectID,
+		&i.IssueID,
+		&i.LineageID,
+		&i.AuthorizationSessionID,
+		&i.AllowedActions,
+		&i.ExplicitDenies,
+		&i.DelegationDepthRemaining,
+		&i.AllowedChildPrincipalIds,
+		&i.CapabilityEnvelope,
 	)
 	return i, err
 }

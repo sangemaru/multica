@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AppConfigSchema,
+  AuthorizationDecisionExplanationSchema,
   AgentTaskListSchema,
   AutopilotRunSchema,
   FALLBACK_AUTOPILOT_RUN,
@@ -61,6 +62,36 @@ const baseIssue = {
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };
+
+describe("AuthorizationDecisionExplanationSchema", () => {
+  it.each([
+    ["allowed", "not_recorded_by_authorization_ledger"],
+    ["denied", "not_reached"],
+    ["observed_deny", "not_recorded_by_authorization_ledger"],
+  ] as const)("accepts the %s explanation contract", (outcome, providerCallStatus) => {
+    const parsed = AuthorizationDecisionExplanationSchema.parse({
+      id: "decision-1",
+      workspace_id: "workspace-1",
+      path: "mention",
+      evaluation_phase: "admission",
+      action: "agent:invoke",
+      principal_type: "harness",
+      credential_class: "harness_session",
+      outcome,
+      enforcement: outcome === "observed_deny" ? "observe_only" : "enforced",
+      reason_code: outcome === "allowed" ? "session_scope_allow" : "test_deny",
+      policy_version: "session-v1",
+      policy_layer: "delegated_session",
+      explanation: "Bounded explanation.",
+      next_step: outcome === "allowed" ? "none" : "review_policy_or_request_approval",
+      task_created: outcome === "allowed",
+      provider_call_status: providerCallStatus,
+      created_at: "2026-07-29T00:00:00Z",
+    });
+    expect(parsed.outcome).toBe(outcome);
+    expect(parsed.provider_call_status).toBe(providerCallStatus);
+  });
+});
 
 describe("IssueSchema (via ListIssuesResponseSchema)", () => {
   it("accepts a primitive metadata KV map", () => {

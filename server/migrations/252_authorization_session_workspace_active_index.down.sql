@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS authorization_session_workspace_active_idx;

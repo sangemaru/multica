@@ -59,6 +59,26 @@ func GenerateAgentTaskToken() (string, error) {
 	return "mat_" + hex.EncodeToString(b), nil
 }
 
+// GenerateHarnessSessionToken creates an opaque delegated external-harness
+// credential. Only its SHA-256 hash is persisted by the server.
+func GenerateHarnessSessionToken() (string, error) {
+	return generateOpaqueToken("mha_", "harness session")
+}
+
+// GenerateHumanInteractiveSessionToken creates an opaque short-lived member
+// credential after the server verifies recent interactive presence.
+func GenerateHumanInteractiveSessionToken() (string, error) {
+	return generateOpaqueToken("mhi_", "human interactive session")
+}
+
+func generateOpaqueToken(prefix, label string) (string, error) {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate %s token: %w", label, err)
+	}
+	return prefix + hex.EncodeToString(b), nil
+}
+
 // HashToken returns the hex-encoded SHA-256 hash of a token string.
 func HashToken(token string) string {
 	h := sha256.Sum256([]byte(token))

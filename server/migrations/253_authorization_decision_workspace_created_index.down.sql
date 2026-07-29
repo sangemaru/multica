@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS authorization_decision_workspace_created_idx;

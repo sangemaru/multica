@@ -2,11 +2,13 @@ package handler
 
 import (
 	"net/http"
+
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 )
 
 // RequireHumanActor is a chi-style middleware that rejects requests
-// authenticated via a machine credential — currently mat_ task tokens
-// and mcn_ cloud-node PATs. It exists for endpoints whose
+// authenticated via a machine credential — task tokens, cloud-node PATs,
+// daemon tokens, and delegated harness sessions. It exists for endpoints whose
 // authorization model is "the human owner authorized this", not
 // "anyone holding the owner's credentials authorized this".
 //
@@ -18,18 +20,18 @@ import (
 // token kind the caller used:
 //
 //   - JWT cookie / mul_ PAT  → X-User-ID = the human's user id.
-//                              X-Actor-Source is left empty.
+//     X-Actor-Source is left empty.
 //   - mat_ task token        → X-User-ID = the OWNING human's user id,
-//                              plus X-Agent-ID, X-Task-ID, and the
-//                              authoritative server-set header
-//                              `X-Actor-Source: task_token`.
+//     plus X-Agent-ID, X-Task-ID, and the
+//     authoritative server-set header
+//     `X-Actor-Source: task_token`.
 //   - mcn_ cloud-node PAT    → X-User-ID = the OWNING human's user id,
-//                              plus `X-Actor-Source: cloud_pat`.
-//                              The token authenticates a cloud-runtime
-//                              EC2 node operating on the owner's
-//                              behalf — same conceptual category as
-//                              mat_ (machine running owner-scoped
-//                              code) for authorization purposes.
+//     plus `X-Actor-Source: cloud_pat`.
+//     The token authenticates a cloud-runtime
+//     EC2 node operating on the owner's
+//     behalf — same conceptual category as
+//     mat_ (machine running owner-scoped
+//     code) for authorization purposes.
 //
 // The mat_ and mcn_ designs (MUL-2600 and the cloud-node PAT story
 // respectively) were both deliberately built this way: every request
@@ -94,15 +96,32 @@ import (
 // addition of a new value is the moment to decide whether it's
 // human-equivalent or machine-equivalent.
 func RequireHumanActor(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// X-Actor-Source is server-set only. The auth middleware
-		// strips any client-supplied value before stamping its own,
-		// so a non-empty value here is authoritative.
-		switch r.Header.Get("X-Actor-Source") {
-		case "task_token", "cloud_pat":
-			writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return RequireHumanActorWithEnforcement(true)(next)
+}
+
+// RequireHumanActorWithEnforcement supports the migration window. Machine
+// credentials are always denied. When enforceAllowlist is false, legacy JWT
+// and personal-token identities remain compatible; when true, only a
+// presence-checked human_interactive_session is accepted.
+func RequireHumanActorWithEnforcement(enforceAllowlist bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, ok := requestidentity.FromContext(r.Context())
+			if ok {
+				switch id.CredentialClass {
+				case requestidentity.CredentialAgentTaskToken,
+					requestidentity.CredentialCloudNodePAT,
+					requestidentity.CredentialDaemonToken,
+					requestidentity.CredentialHarnessSession:
+					writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
+					return
+				}
+			}
+			if enforceAllowlist && (!ok || id.CredentialClass != requestidentity.CredentialHumanInteractive || id.PrincipalType != requestidentity.PrincipalMember) {
+				writeError(w, http.StatusForbidden, "a human_interactive_session is required")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

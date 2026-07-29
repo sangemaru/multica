@@ -268,15 +268,21 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- runtime-only revoke and could still be claimed because ClaimAgentTask does
 -- not gate on agent.archived_at).
 --
--- We use 'cancelled' rather than 'failed' so the daemon's per-task status
--- poller (watchTaskCancellation) interrupts the running agent gracefully.
--- Returns the affected rows so the caller can broadcast task:cancelled and
--- reconcile per-agent status.
+-- This legacy bulk transition is deliberately limited to work that never
+-- started. Running work must pass through TaskService.CancelTask so the
+-- revocation ledger distinguishes request, acknowledgement, and termination.
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now()
 WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
-  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+  AND started_at IS NULL
+  AND status IN ('queued', 'dispatched', 'waiting_local_directory')
 RETURNING *;
+
+-- name: ListCancellableAgentTasksByRuntimeOrAgent :many
+SELECT * FROM agent_task_queue
+WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+ORDER BY created_at;
 
 -- name: DeleteAgentRuntime :exec
 DELETE FROM agent_runtime WHERE id = $1;

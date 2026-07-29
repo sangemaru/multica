@@ -102,8 +102,9 @@ func TestTerminalTransitionsNotifyRuntime(t *testing.T) {
 		t.Fatalf("unexpected failure wakeups: %#v", recorder.calls)
 	}
 
-	// Cancellation is finalized in TaskService because both issue and chat
-	// handlers share that path.
+	// Cancellation is a request until the runtime confirms the host process
+	// returned. The terminal wakeup belongs to that confirmation, not to the
+	// initial server denial.
 	recorder.calls = nil
 	var cancelledTaskID string
 	if err := testPool.QueryRow(ctx, `
@@ -117,8 +118,20 @@ func TestTerminalTransitionsNotifyRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CancelTask: %v", err)
 	}
-	if cancelled.Status != "cancelled" {
-		t.Fatalf("CancelTask status = %q, want cancelled", cancelled.Status)
+	if cancelled.Status != "running" || !cancelled.CancellationRequestedAt.Valid {
+		t.Fatalf("CancelTask = status %q requested=%v, want running cancellation request",
+			cancelled.Status, cancelled.CancellationRequestedAt.Valid)
+	}
+	if got := len(recorder.calls); got != 0 {
+		t.Fatalf("cancellation request emitted terminal wakeups: %#v", recorder.calls)
+	}
+	terminated, err := testHandler.TaskService.ConfirmTaskTermination(ctx, parseUUID(cancelledTaskID))
+	if err != nil {
+		t.Fatalf("ConfirmTaskTermination: %v", err)
+	}
+	if terminated.Status != "cancelled" || !terminated.TerminationConfirmedAt.Valid {
+		t.Fatalf("ConfirmTaskTermination = status %q confirmed=%v, want cancelled/confirmed",
+			terminated.Status, terminated.TerminationConfirmedAt.Valid)
 	}
 	if got := len(recorder.calls); got != 1 || recorder.calls[0].runtimeID != runtimeID || recorder.calls[0].taskID != "" {
 		t.Fatalf("unexpected cancellation wakeups: %#v", recorder.calls)

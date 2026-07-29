@@ -30,6 +30,8 @@ export type WSEventType =
   | "task:completed"
   | "task:failed"
   | "task:message"
+  | "task:cancellation_requested"
+  | "task:cancellation_acknowledged"
   | "task:cancelled"
   | "inbox:new"
   | "inbox:read"
@@ -328,6 +330,9 @@ export interface TaskCancelledPayload {
   status: string;
 }
 
+export type TaskCancellationRequestedPayload = TaskCancelledPayload;
+export type TaskCancellationAcknowledgedPayload = TaskCancelledPayload;
+
 export interface ReactionAddedPayload {
   reaction: Reaction;
   issue_id: string;
@@ -496,6 +501,8 @@ export interface WSEventPayloadMap {
   "task:completed": TaskCompletedPayload;
   "task:failed": TaskFailedPayload;
   "task:message": TaskMessagePayload;
+  "task:cancellation_requested": TaskCancellationRequestedPayload;
+  "task:cancellation_acknowledged": TaskCancellationAcknowledgedPayload;
   "task:cancelled": TaskCancelledPayload;
   "task:progress": unknown;
   "inbox:new": InboxNewPayload;

@@ -18,20 +18,21 @@ const (
 	labelModelAlias     = "model_alias"
 
 	// PR3 labels (funnel / community / commercial).
-	labelSignupSource = "signup_source"
-	labelPlatform     = "platform"
-	labelPath         = "path"
-	labelCadence      = "cadence"
-	labelTriggerKind  = "trigger_kind"
-	labelReason       = "reason"
-	labelRecoverable  = "recoverable"
-	labelKind         = "kind"
-	labelStatus       = "status"
-	labelEventKind    = "event_kind"
-	labelAction       = "action"
-	labelResult       = "result"
-	labelOp           = "op"
-	labelGate         = "gate"
+	labelSignupSource    = "signup_source"
+	labelPlatform        = "platform"
+	labelPath            = "path"
+	labelCadence         = "cadence"
+	labelTriggerKind     = "trigger_kind"
+	labelReason          = "reason"
+	labelRecoverable     = "recoverable"
+	labelKind            = "kind"
+	labelStatus          = "status"
+	labelEventKind       = "event_kind"
+	labelAction          = "action"
+	labelResult          = "result"
+	labelOp              = "op"
+	labelGate            = "gate"
+	labelCredentialClass = "credential_class"
 )
 
 var businessMetricLabels = map[string][]string{
@@ -83,6 +84,7 @@ var businessMetricLabels = map[string][]string{
 	"multica_github_pr_review_total":                   {labelResult},
 	"multica_cloudruntime_request_total":               {labelOp, labelStatus},
 	"multica_cloudruntime_request_duration_seconds":    {labelOp},
+	"multica_authorization_dry_run_denied_total":       {labelPath, labelCredentialClass, labelReason},
 	"multica_feedback_submitted_total":                 {labelKind, labelPlatform},
 	"multica_contact_sales_submitted_total":            {labelSource},
 	"multica_chat_output_local_path_total":             {labelKind},

@@ -10,6 +10,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -79,14 +80,13 @@ func WithDaemonContext(ctx context.Context, workspaceID, daemonID string) contex
 func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.DaemonTokenCache, cloudPAT *auth.CloudPATVerifier) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// X-Actor-Source is server-set only — strip any
-			// client-supplied value before any branch can re-stamp
-			// it. This mirrors what Auth middleware does (see auth.go
-			// "X-Actor-Source is server-set only..." comment) and
-			// keeps the contract uniform across both middlewares: a
-			// downstream guard like handler.RequireHumanActor can
-			// trust this header regardless of which auth path the
-			// request arrived on.
+			// Identity headers are compatibility outputs only. Every trusted
+			// identity field is removed before authentication and replaced by a
+			// typed server-derived context value on successful authentication.
+			r.Header.Del("X-User-ID")
+			r.Header.Del("X-User-Email")
+			r.Header.Del("X-Agent-ID")
+			r.Header.Del("X-Task-ID")
 			r.Header.Del("X-Actor-Source")
 
 			authHeader := r.Header.Get("Authorization")
@@ -111,6 +111,13 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 					ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, id.WorkspaceID)
 					ctx = context.WithValue(ctx, ctxKeyDaemonID, id.DaemonID)
 					ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
+					ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+						PrincipalType:   requestidentity.PrincipalRuntime,
+						PrincipalID:     id.DaemonID,
+						CredentialClass: requestidentity.CredentialDaemonToken,
+						WorkspaceID:     id.WorkspaceID,
+						DaemonID:        id.DaemonID,
+					})
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -141,6 +148,13 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, identity.WorkspaceID)
 				ctx = context.WithValue(ctx, ctxKeyDaemonID, identity.DaemonID)
 				ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
+				ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalRuntime,
+					PrincipalID:     identity.DaemonID,
+					CredentialClass: requestidentity.CredentialDaemonToken,
+					WorkspaceID:     identity.WorkspaceID,
+					DaemonID:        identity.DaemonID,
+				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -182,6 +196,11 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				// differently depending on which one routed it.
 				r.Header.Set("X-Actor-Source", "cloud_pat")
 				ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathCloudPAT)
+				ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalRuntime,
+					CredentialClass: requestidentity.CredentialCloudNodePAT,
+					UserID:          identity.OwnerID,
+				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -193,6 +212,12 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				if userID, ok := patCache.Get(r.Context(), hash); ok {
 					r.Header.Set("X-User-ID", userID)
 					ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathPAT)
+					ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+						PrincipalType:   requestidentity.PrincipalMember,
+						PrincipalID:     userID,
+						CredentialClass: requestidentity.CredentialLegacyPersonalToken,
+						UserID:          userID,
+					})
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
@@ -222,6 +247,12 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				go queries.UpdatePersonalAccessTokenLastUsed(context.Background(), pat.ID)
 
 				ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathPAT)
+				ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalMember,
+					PrincipalID:     userID,
+					CredentialClass: requestidentity.CredentialLegacyPersonalToken,
+					UserID:          userID,
+				})
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -251,6 +282,12 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 			}
 			r.Header.Set("X-User-ID", sub)
 			ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathJWT)
+			ctx = requestidentity.WithRequest(ctx, requestidentity.RequestIdentity{
+				PrincipalType:   requestidentity.PrincipalMember,
+				PrincipalID:     sub,
+				CredentialClass: requestidentity.CredentialLegacyHumanSession,
+				UserID:          sub,
+			})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

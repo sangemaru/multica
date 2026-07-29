@@ -281,30 +281,31 @@ type AgentTaskResponse struct {
 	// as `## Workspace Context` so every agent running in this workspace —
 	// regardless of issue / chat / autopilot / quick-create — sees the same
 	// shared context. Empty when the workspace owner hasn't set it.
-	WorkspaceContext   string                `json:"workspace_context,omitempty"`
-	ThreadName         string                `json:"thread_name,omitempty"` // semantic title for provider-native session/thread history
-	Status             string                `json:"status"`
-	Priority           int32                 `json:"priority"`
-	DispatchedAt       *string               `json:"dispatched_at"`
-	StartedAt          *string               `json:"started_at"`
-	CompletedAt        *string               `json:"completed_at"`
-	Result             any                   `json:"result"`
-	Error              *string               `json:"error"`
-	FailureReason      string                `json:"failure_reason,omitempty"` // see TaskService.MaybeRetryFailedTask
-	Attempt            int32                 `json:"attempt"`
-	MaxAttempts        int32                 `json:"max_attempts"`
-	ParentTaskID       *string               `json:"parent_task_id,omitempty"`
-	IsLeaderTask       bool                  `json:"is_leader_task,omitempty"`
-	Agent              *TaskAgentData        `json:"agent,omitempty"`
-	ConnectedApps      []ConnectedAppData    `json:"connected_apps,omitempty"` // daemon-claim only: per-run app capabilities mounted through runtime MCP overlays
-	Repos              []RepoData            `json:"repos,omitempty"`
-	ProjectID          string                `json:"project_id,omitempty"`          // issue's project, when present
-	ProjectTitle       string                `json:"project_title,omitempty"`       // for surfacing in agent context
-	ProjectDescription string                `json:"project_description,omitempty"` // durable project-level context injected into the brief
-	ProjectResources   []ProjectResourceData `json:"project_resources,omitempty"`   // resources attached to the project
-	CreatedAt          string                `json:"created_at"`
-	PriorSessionID     string                `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
-	PriorWorkDir       string                `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+	WorkspaceContext   string                  `json:"workspace_context,omitempty"`
+	ThreadName         string                  `json:"thread_name,omitempty"` // semantic title for provider-native session/thread history
+	Status             string                  `json:"status"`
+	Priority           int32                   `json:"priority"`
+	DispatchedAt       *string                 `json:"dispatched_at"`
+	StartedAt          *string                 `json:"started_at"`
+	CompletedAt        *string                 `json:"completed_at"`
+	Result             any                     `json:"result"`
+	Error              *string                 `json:"error"`
+	FailureReason      string                  `json:"failure_reason,omitempty"` // see TaskService.MaybeRetryFailedTask
+	Revocation         *TaskRevocationResponse `json:"revocation,omitempty"`
+	Attempt            int32                   `json:"attempt"`
+	MaxAttempts        int32                   `json:"max_attempts"`
+	ParentTaskID       *string                 `json:"parent_task_id,omitempty"`
+	IsLeaderTask       bool                    `json:"is_leader_task,omitempty"`
+	Agent              *TaskAgentData          `json:"agent,omitempty"`
+	ConnectedApps      []ConnectedAppData      `json:"connected_apps,omitempty"` // daemon-claim only: per-run app capabilities mounted through runtime MCP overlays
+	Repos              []RepoData              `json:"repos,omitempty"`
+	ProjectID          string                  `json:"project_id,omitempty"`          // issue's project, when present
+	ProjectTitle       string                  `json:"project_title,omitempty"`       // for surfacing in agent context
+	ProjectDescription string                  `json:"project_description,omitempty"` // durable project-level context injected into the brief
+	ProjectResources   []ProjectResourceData   `json:"project_resources,omitempty"`   // resources attached to the project
+	CreatedAt          string                  `json:"created_at"`
+	PriorSessionID     string                  `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
+	PriorWorkDir       string                  `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if
 	// any) is then an older fallback. The daemon surfaces the continuity gap in
@@ -396,6 +397,18 @@ type AgentTaskResponse struct {
 	// owning user; the daemon must not fall back to its own credential. See
 	// MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+}
+
+// TaskRevocationResponse keeps four different facts separate. In particular,
+// server_access_denied=true and state=cancellation_requested never claim that
+// the runtime or host process has stopped.
+type TaskRevocationResponse struct {
+	State                      string  `json:"state"`
+	ServerAccessDenied         bool    `json:"server_access_denied"`
+	CancellationRequestedAt    *string `json:"cancellation_requested_at"`
+	RuntimeAcknowledgedAt      *string `json:"runtime_acknowledged_at"`
+	HostTerminationConfirmed   bool    `json:"host_termination_confirmed"`
+	HostTerminationConfirmedAt *string `json:"host_termination_confirmed_at"`
 }
 
 // TaskAttribution is the wire shape of a run's accountable-human provenance
@@ -611,6 +624,24 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 	if t.HandoffNote.Valid {
 		handoffNote = t.HandoffNote.String
 	}
+	var revocation *TaskRevocationResponse
+	if t.CancellationRequestedAt.Valid {
+		state := "cancellation_requested"
+		if t.CancellationRuntimeAcknowledgedAt.Valid {
+			state = "runtime_acknowledged"
+		}
+		if t.TerminationConfirmedAt.Valid {
+			state = "terminated"
+		}
+		revocation = &TaskRevocationResponse{
+			State:                      state,
+			ServerAccessDenied:         true,
+			CancellationRequestedAt:    timestampToPtr(t.CancellationRequestedAt),
+			RuntimeAcknowledgedAt:      timestampToPtr(t.CancellationRuntimeAcknowledgedAt),
+			HostTerminationConfirmed:   t.TerminationConfirmedAt.Valid,
+			HostTerminationConfirmedAt: timestampToPtr(t.TerminationConfirmedAt),
+		}
+	}
 	return AgentTaskResponse{
 		ID:                  uuidToString(t.ID),
 		AgentID:             uuidToString(t.AgentID),
@@ -625,6 +656,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		Result:              result,
 		Error:               textToPtr(t.Error),
 		FailureReason:       failureReason,
+		Revocation:          revocation,
 		Attempt:             t.Attempt,
 		MaxAttempts:         t.MaxAttempts,
 		ParentTaskID:        uuidToPtr(t.ParentTaskID),
@@ -1987,14 +2019,14 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cancel all pending/active tasks for this agent. Discard the returned
-	// rows here — the agent:archived event below already triggers a full
-	// active-tasks invalidation on every connected client, so per-task
-	// task:cancelled events would be redundant noise.
-	if cancelled, err := h.Queries.CancelAgentTasksByAgent(r.Context(), agent.ID); err != nil {
-		slog.Warn("cancel agent tasks on archive failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+	// Deny all active work after archiving. Pre-start work terminates
+	// immediately; running work remains visibly pending until the runtime
+	// acknowledges the request and confirms process termination.
+	if requested, err := h.TaskService.CancelTasksForAgent(r.Context(), agent.ID); err != nil {
+		slog.Warn("request agent task cancellation on archive failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 	} else {
-		h.TaskService.CaptureCancelledTasks(r.Context(), cancelled)
+		slog.Info("agent task cancellation requested on archive",
+			append(logger.RequestAttrs(r), "agent_id", id, "count", len(requested))...)
 	}
 
 	wsID := uuidToString(archived.WorkspaceID)
@@ -2047,20 +2079,13 @@ func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// CancelAgentTasks bulk-cancels every active task (queued/dispatched/running)
-// belonging to an agent. Powers the agents-list "Cancel all tasks" row
-// action. Same permission gate as archive (canManageAgent — owner or
-// workspace admin/owner). Each cancelled row triggers a task:cancelled WS
-// event so connected clients clear their live cards immediately.
-//
-// Note: a `running` task on the daemon side won't actually halt for up to
-// ~5 seconds (daemon polls GetTaskStatus on that interval). The DB row is
-// marked cancelled instantly, but the child process keeps going briefly;
-// see daemon/daemon.go:919-942 for the polling loop. Surface this in the
-// confirm-dialog copy so users aren't surprised by trailing transcript
-// lines.
+// CancelAgentTasks requests cancellation for every active task belonging to an
+// agent. The response is additive for compatibility: cancelled counts work
+// already known terminal; cancellation_requested counts running host processes
+// whose termination is still unconfirmed.
 type cancelAgentTasksResponse struct {
-	Cancelled int `json:"cancelled"`
+	Cancelled             int `json:"cancelled"`
+	CancellationRequested int `json:"cancellation_requested"`
 }
 
 func (h *Handler) CancelAgentTasks(w http.ResponseWriter, r *http.Request) {
@@ -2073,16 +2098,31 @@ func (h *Handler) CancelAgentTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cancelled, err := h.TaskService.CancelTasksForAgent(r.Context(), parseUUID(id))
+	requested, err := h.TaskService.CancelTasksForAgent(r.Context(), parseUUID(id))
 	if err != nil {
 		slog.Warn("cancel agent tasks failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 		writeError(w, http.StatusInternalServerError, "failed to cancel tasks")
 		return
 	}
 
-	slog.Info("agent tasks cancelled",
-		append(logger.RequestAttrs(r), "agent_id", id, "count", len(cancelled))...)
-	writeJSON(w, http.StatusOK, cancelAgentTasksResponse{Cancelled: len(cancelled)})
+	var cancelled, pending int
+	for _, task := range requested {
+		if taskTerminationConfirmed(task) {
+			cancelled++
+		} else if task.CancellationRequestedAt.Valid {
+			pending++
+		}
+	}
+	slog.Info("agent task cancellation processed",
+		append(logger.RequestAttrs(r), "agent_id", id, "terminated", cancelled, "pending_host_termination", pending)...)
+	writeJSON(w, http.StatusOK, cancelAgentTasksResponse{
+		Cancelled:             cancelled,
+		CancellationRequested: pending,
+	})
+}
+
+func taskTerminationConfirmed(task db.AgentTaskQueue) bool {
+	return task.TerminationConfirmedAt.Valid || (task.Status == "cancelled" && !task.StartedAt.Valid)
 }
 
 func (h *Handler) ListAgentTasks(w http.ResponseWriter, r *http.Request) {

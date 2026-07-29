@@ -1,0 +1,2 @@
+DROP TRIGGER IF EXISTS authorization_agent_class_assignment_append_only ON authorization_agent_class_assignment;
+DROP TABLE IF EXISTS authorization_agent_class_assignment;

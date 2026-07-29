@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS authorization_agent_class_assignment_agent_created_idx;

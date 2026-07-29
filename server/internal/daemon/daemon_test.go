@@ -1152,6 +1152,7 @@ func TestShouldInterruptAgent(t *testing.T) {
 		err    error
 		want   bool
 	}{
+		{name: "cancellation requested", status: "cancellation_requested", err: nil, want: true},
 		{name: "status cancelled", status: "cancelled", err: nil, want: true},
 		{name: "status failed (offline sweeper)", status: "failed", err: nil, want: true},
 		{name: "status completed (finished elsewhere)", status: "completed", err: nil, want: true},
@@ -4491,6 +4492,9 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/cancel-observed"):
+			recordCall("cancel-observed")
+			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/cancel-ack"):
 			recordCall("cancel-ack")
 			w.WriteHeader(http.StatusOK)
@@ -4499,7 +4503,7 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 				recordCall("poll-status")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"status":"cancelled"}`))
+				_, _ = w.Write([]byte(`{"status":"cancellation_requested"}`))
 			} else {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
@@ -4538,11 +4542,13 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 	copy(order, callOrder)
 	mu.Unlock()
 
-	pollStatusIdx, ackIdx := -1, -1
+	pollStatusIdx, observedIdx, ackIdx := -1, -1, -1
 	for i, name := range order {
 		switch name {
 		case "poll-status":
 			pollStatusIdx = i
+		case "cancel-observed":
+			observedIdx = i
 		case "cancel-ack":
 			ackIdx = i
 		}
@@ -4553,8 +4559,11 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 	if ackIdx == -1 {
 		t.Fatalf("cancel-ack was never posted on the poll-cancelled path (order: %v)", order)
 	}
-	if ackIdx < pollStatusIdx {
-		t.Fatalf("cancel-ack before the poll observed the cancellation (order: %v)", order)
+	if observedIdx == -1 {
+		t.Fatalf("cancel-observed was never posted on the poll-cancelled path (order: %v)", order)
+	}
+	if !(pollStatusIdx < observedIdx && observedIdx < ackIdx) {
+		t.Fatalf("want status < runtime acknowledgement < termination confirmation, order: %v", order)
 	}
 }
 
@@ -4564,17 +4573,21 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 func TestHandleTask_AcksCancelOnPostRunStatusCheck(t *testing.T) {
 	t.Parallel()
 
+	var observedCalls atomic.Int64
 	var ackCalls atomic.Int64
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/cancel-observed"):
+			observedCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/cancel-ack"):
 			ackCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"cancelled"}`))
+			_, _ = w.Write([]byte(`{"status":"cancellation_requested"}`))
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -4604,6 +4617,9 @@ func TestHandleTask_AcksCancelOnPostRunStatusCheck(t *testing.T) {
 
 	if got := ackCalls.Load(); got != 1 {
 		t.Fatalf("cancel-ack calls = %d, want 1", got)
+	}
+	if got := observedCalls.Load(); got != 1 {
+		t.Fatalf("cancel-observed calls = %d, want 1", got)
 	}
 }
 

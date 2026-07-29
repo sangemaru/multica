@@ -277,7 +277,8 @@ const createAutopilotTask = `-- name: CreateAutopilotTask :one
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, autopilot_run_id, trigger_summary,
     originator_user_id, accountable_user_id, rule_version_id,
-    originator_source, trigger_evidence_kind, trigger_evidence_ref_id
+    originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
+    admission_decision_id, authorization_policy_version, lineage_id, budget_reservation_id
 )
 VALUES (
     $1, $2, NULL, 'queued', $3, $4, $5,
@@ -286,23 +287,28 @@ VALUES (
     $8,
     $9,
     $10,
-    $11
+    $11,
+    $12, $13, $14, $15
 )
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, admission_decision_id, authorization_policy_version, lineage_id, budget_reservation_id, cancellation_requested_at, cancellation_runtime_acknowledged_at, termination_confirmed_at
 `
 
 type CreateAutopilotTaskParams struct {
-	AgentID              pgtype.UUID `json:"agent_id"`
-	RuntimeID            pgtype.UUID `json:"runtime_id"`
-	Priority             int32       `json:"priority"`
-	AutopilotRunID       pgtype.UUID `json:"autopilot_run_id"`
-	TriggerSummary       pgtype.Text `json:"trigger_summary"`
-	OriginatorUserID     pgtype.UUID `json:"originator_user_id"`
-	AccountableUserID    pgtype.UUID `json:"accountable_user_id"`
-	RuleVersionID        pgtype.UUID `json:"rule_version_id"`
-	OriginatorSource     pgtype.Text `json:"originator_source"`
-	TriggerEvidenceKind  pgtype.Text `json:"trigger_evidence_kind"`
-	TriggerEvidenceRefID pgtype.UUID `json:"trigger_evidence_ref_id"`
+	AgentID                    pgtype.UUID `json:"agent_id"`
+	RuntimeID                  pgtype.UUID `json:"runtime_id"`
+	Priority                   int32       `json:"priority"`
+	AutopilotRunID             pgtype.UUID `json:"autopilot_run_id"`
+	TriggerSummary             pgtype.Text `json:"trigger_summary"`
+	OriginatorUserID           pgtype.UUID `json:"originator_user_id"`
+	AccountableUserID          pgtype.UUID `json:"accountable_user_id"`
+	RuleVersionID              pgtype.UUID `json:"rule_version_id"`
+	OriginatorSource           pgtype.Text `json:"originator_source"`
+	TriggerEvidenceKind        pgtype.Text `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID       pgtype.UUID `json:"trigger_evidence_ref_id"`
+	AdmissionDecisionID        pgtype.UUID `json:"admission_decision_id"`
+	AuthorizationPolicyVersion pgtype.Text `json:"authorization_policy_version"`
+	LineageID                  pgtype.UUID `json:"lineage_id"`
+	BudgetReservationID        pgtype.UUID `json:"budget_reservation_id"`
 }
 
 // =====================
@@ -333,6 +339,10 @@ func (q *Queries) CreateAutopilotTask(ctx context.Context, arg CreateAutopilotTa
 		arg.OriginatorSource,
 		arg.TriggerEvidenceKind,
 		arg.TriggerEvidenceRefID,
+		arg.AdmissionDecisionID,
+		arg.AuthorizationPolicyVersion,
+		arg.LineageID,
+		arg.BudgetReservationID,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(
@@ -385,6 +395,13 @@ func (q *Queries) CreateAutopilotTask(ctx context.Context, arg CreateAutopilotTa
 		&i.AccountableUserID,
 		&i.SessionRolloutMissing,
 		&i.RetiredSessionID,
+		&i.AdmissionDecisionID,
+		&i.AuthorizationPolicyVersion,
+		&i.LineageID,
+		&i.BudgetReservationID,
+		&i.CancellationRequestedAt,
+		&i.CancellationRuntimeAcknowledgedAt,
+		&i.TerminationConfirmedAt,
 	)
 	return i, err
 }
@@ -746,7 +763,7 @@ func (q *Queries) GetAutopilotRunByWebhookDelivery(ctx context.Context, webhookD
 }
 
 const getAutopilotTaskByRun = `-- name: GetAutopilotTaskByRun :one
-SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id FROM agent_task_queue
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, admission_decision_id, authorization_policy_version, lineage_id, budget_reservation_id, cancellation_requested_at, cancellation_runtime_acknowledged_at, termination_confirmed_at FROM agent_task_queue
 WHERE autopilot_run_id = $1
 ORDER BY created_at
 LIMIT 1
@@ -807,6 +824,13 @@ func (q *Queries) GetAutopilotTaskByRun(ctx context.Context, autopilotRunID pgty
 		&i.AccountableUserID,
 		&i.SessionRolloutMissing,
 		&i.RetiredSessionID,
+		&i.AdmissionDecisionID,
+		&i.AuthorizationPolicyVersion,
+		&i.LineageID,
+		&i.BudgetReservationID,
+		&i.CancellationRequestedAt,
+		&i.CancellationRuntimeAcknowledgedAt,
+		&i.TerminationConfirmedAt,
 	)
 	return i, err
 }

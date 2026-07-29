@@ -83,7 +83,9 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 	`, creatorAID, ownerH).Scan(&creatorTaskID); err != nil {
 		t.Fatalf("create A's acting task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID)
+	})
 
 	// Step 1: agent A creates an issue through the ordinary create path and
 	// assigns it to the private-leader squad in the same call.
@@ -93,8 +95,7 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})
-	r.Header.Set("X-Agent-ID", creatorAID)
-	r.Header.Set("X-Task-ID", creatorTaskID)
+	r = withAgentTaskIdentity(r, creatorAID, creatorTaskID)
 	testHandler.CreateIssue(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -141,8 +142,7 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 	r = newRequest("POST", "/api/issues/"+created.ID+"/comments", map[string]any{
 		"content": "handing the private part to [@Worker](mention://agent/" + workerJID + ")",
 	})
-	r.Header.Set("X-Agent-ID", leaderID)
-	r.Header.Set("X-Task-ID", leaderTaskID)
+	r = withAgentTaskIdentity(r, leaderID, leaderTaskID)
 	r = withURLParam(r, "id", created.ID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -203,15 +203,16 @@ func TestAgentCreateOriginator_E2E_UpdateAssignSquad_HandlerGateAdmitsPrivateLea
 	`, creatorAID, ownerH).Scan(&creatorTaskID); err != nil {
 		t.Fatalf("create A's acting task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, creatorTaskID)
+	})
 
 	// Agent A creates an unassigned issue via the ordinary path.
 	w := httptest.NewRecorder()
 	r := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title": "MUL-4305 E2E unassigned then squad-assigned",
 	})
-	r.Header.Set("X-Agent-ID", creatorAID)
-	r.Header.Set("X-Task-ID", creatorTaskID)
+	r = withAgentTaskIdentity(r, creatorAID, creatorTaskID)
 	testHandler.CreateIssue(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -232,8 +233,7 @@ func TestAgentCreateOriginator_E2E_UpdateAssignSquad_HandlerGateAdmitsPrivateLea
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})
-	r.Header.Set("X-Agent-ID", creatorAID)
-	r.Header.Set("X-Task-ID", creatorTaskID)
+	r = withAgentTaskIdentity(r, creatorAID, creatorTaskID)
 	r = withURLParam(r, "id", created.ID)
 	testHandler.UpdateIssue(w, r)
 	if w.Code != http.StatusOK {

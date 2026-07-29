@@ -12,12 +12,12 @@ import (
 // revokeAndRemoveMember converges all server-side state that should follow a
 // member leaving a workspace: every runtime they own becomes unusable, every
 // agent pinned to one of those runtimes is archived, every in-flight task on
-// those runtimes is cancelled (cancelled rather than failed so the daemon's
-// per-task status poller interrupts the running agent gracefully), the
+// those runtimes loses server access and receives a cancellation request, the
 // daemon_token rows for those runtimes are deleted, and finally the member row
 // itself is removed.
 //
-// All DB writes run inside a single transaction so a partial revocation never
+// Core access-removal writes run inside a single transaction so a partial
+// revocation never
 // leaves the workspace half-converged — e.g. a member who is "gone" but whose
 // runtime row is still active. Once the transaction commits, daemon_token
 // cache entries are invalidated and events are published (see
@@ -78,7 +78,10 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 			return empty, err
 		}
 
-		// Cancel by runtime AND by archived agent. agent.runtime_id can be
+		// Immediately terminate pre-start work by runtime AND by archived agent.
+		// Running work is intentionally excluded from this bulk projection and
+		// enters the durable revocation lifecycle after commit below.
+		// agent.runtime_id can be
 		// reassigned via UpdateAgent without rewriting the runtime_id on
 		// historical agent_task_queue rows, so an archived agent may still
 		// have queued/running tasks pinned to a different runtime — and
@@ -163,6 +166,44 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 		return empty, err
 	}
 
+	// Membership, agent eligibility, runtime liveness, and daemon credentials
+	// are now revoked even if a host process is still alive. Record an honest
+	// cancellation lifecycle for any such running process; CancelTask deletes
+	// task-scoped tokens immediately and emits cancellation_requested without
+	// claiming host termination.
+	if h.TaskService != nil && len(result.Runtimes) > 0 {
+		runtimeIDs := make([]pgtype.UUID, len(result.Runtimes))
+		for i, runtime := range result.Runtimes {
+			runtimeIDs[i] = runtime.ID
+		}
+		agentIDs := make([]pgtype.UUID, len(result.ArchivedAgents))
+		for i, agent := range result.ArchivedAgents {
+			agentIDs[i] = agent.ID
+		}
+		candidates, listErr := h.Queries.ListCancellableAgentTasksByRuntimeOrAgent(ctx,
+			db.ListCancellableAgentTasksByRuntimeOrAgentParams{
+				RuntimeIds: runtimeIDs,
+				AgentIds:   agentIDs,
+			})
+		if listErr != nil {
+			slog.Error("member revocation could not enumerate running task cancellations",
+				"error", listErr)
+		} else {
+			for _, candidate := range candidates {
+				task, cancelErr := h.TaskService.CancelTask(ctx, candidate.ID)
+				if cancelErr != nil {
+					slog.Error("member revocation could not record task cancellation",
+						"task_id", uuidToString(candidate.ID),
+						"error", cancelErr)
+					continue
+				}
+				if task.CancellationRequestedAt.Valid && !task.TerminationConfirmedAt.Valid {
+					result.CancellationRequestedTasks = append(result.CancellationRequestedTasks, *task)
+				}
+			}
+		}
+	}
+
 	return result, nil
 }
 
@@ -171,11 +212,14 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 // Publishing inside the transaction would let subscribers observe a state the
 // tx might still roll back (see TaskService.BroadcastCancelledTasks docstring).
 type revocationResult struct {
-	Runtimes           []db.AgentRuntime
-	ArchivedAgents     []db.Agent
-	CancelledTasks     []db.AgentTaskQueue
-	OfflineRuntimeIDs  []db.ForceOfflineRuntimesByIDsRow
-	RevokedTokenHashes []string
+	Runtimes       []db.AgentRuntime
+	ArchivedAgents []db.Agent
+	CancelledTasks []db.AgentTaskQueue
+	// CancellationRequestedTasks remain host-active until the runtime confirms
+	// termination. TaskService already emitted their non-terminal events.
+	CancellationRequestedTasks []db.AgentTaskQueue
+	OfflineRuntimeIDs          []db.ForceOfflineRuntimesByIDsRow
+	RevokedTokenHashes         []string
 }
 
 func (r revocationResult) isEmpty() bool {
@@ -195,10 +239,8 @@ func (h *Handler) publishRevocation(ctx context.Context, result revocationResult
 		h.DaemonTokenCache.Invalidate(ctx, hash)
 	}
 
-	// Per-task cancellation: TaskService handles status reconciliation and
-	// per-task event broadcast. Run this before the agent:archived burst so
-	// subscribers see "task cancelled" before the parent agent disappears
-	// from active lists, matching the order ArchiveAgent uses.
+	// Pre-start tasks are already terminal and can emit task:cancelled. Running
+	// tasks were separately emitted as task:cancellation_requested above.
 	if h.TaskService != nil && len(result.CancelledTasks) > 0 {
 		h.TaskService.BroadcastCancelledTasks(ctx, result.CancelledTasks)
 	}
@@ -233,6 +275,7 @@ func logRevocation(result revocationResult, workspaceID, userID string, attrs ..
 		"runtimes_revoked", len(result.Runtimes),
 		"agents_archived", len(result.ArchivedAgents),
 		"tasks_cancelled", len(result.CancelledTasks),
+		"task_cancellations_awaiting_host_termination", len(result.CancellationRequestedTasks),
 		"runtimes_taken_offline", len(result.OfflineRuntimeIDs),
 		"daemon_tokens_revoked", len(result.RevokedTokenHashes),
 	}

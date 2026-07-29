@@ -30,14 +30,32 @@ EXIT_CODE=0
 # --------------------------------------------------------------------------
 # Cleanup: kill only services this script started
 # --------------------------------------------------------------------------
+stop_process_tree() {
+  local pid=$1
+  local child
+
+  while IFS= read -r child; do
+    [ -n "$child" ] && stop_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+
+  kill "$pid" 2>/dev/null || true
+}
+
 cleanup() {
+  local script_status=$?
+  if [ "$EXIT_CODE" -eq 0 ] && [ "$script_status" -ne 0 ]; then
+    EXIT_CODE=$script_status
+  fi
+
   echo ""
   if [ "$STARTED_BACKEND" = true ] && [ -n "$BACKEND_PID" ]; then
-    kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null || true
+    stop_process_tree "$BACKEND_PID"
+    wait "$BACKEND_PID" 2>/dev/null || true
     echo "    Stopped backend (PID $BACKEND_PID)"
   fi
   if [ "$STARTED_FRONTEND" = true ] && [ -n "$FRONTEND_PID" ]; then
-    kill "$FRONTEND_PID" 2>/dev/null && wait "$FRONTEND_PID" 2>/dev/null || true
+    stop_process_tree "$FRONTEND_PID"
+    wait "$FRONTEND_PID" 2>/dev/null || true
     echo "    Stopped frontend (PID $FRONTEND_PID)"
   fi
   echo ""
@@ -49,6 +67,8 @@ cleanup() {
   exit "$EXIT_CODE"
 }
 trap cleanup EXIT
+trap 'EXIT_CODE=130; exit 130' INT
+trap 'EXIT_CODE=143; exit 143' TERM
 
 # --------------------------------------------------------------------------
 # Utility: wait until a port responds
@@ -57,7 +77,7 @@ wait_for_port() {
   local port=$1 name=$2 max_wait=${3:-60} path=${4:-/}
   local elapsed=0
   echo "    Waiting for $name on :$port..."
-  while ! curl -sf "http://localhost:${port}${path}" > /dev/null 2>&1; do
+  while ! curl -sf --connect-timeout 1 --max-time 2 "http://localhost:${port}${path}" > /dev/null 2>&1; do
     sleep 1
     elapsed=$((elapsed + 1))
     if [ "$elapsed" -ge "$max_wait" ]; then
@@ -107,7 +127,7 @@ bash scripts/test-go.sh || { EXIT_CODE=1; exit 1; }
 echo ""
 echo "==> [4/5] Starting services for E2E..."
 
-if curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; then
+if curl -sf --connect-timeout 1 --max-time 2 "http://localhost:${PORT}/health" > /dev/null 2>&1; then
   echo "    Backend already running on :$PORT"
 else
   echo "    Starting backend..."
@@ -117,7 +137,7 @@ else
   wait_for_port "$PORT" "Backend" 90 "/health"
 fi
 
-if curl -sf "http://localhost:${FRONTEND_PORT}" > /dev/null 2>&1; then
+if curl -sf --connect-timeout 1 --max-time 2 "http://localhost:${FRONTEND_PORT}" > /dev/null 2>&1; then
   echo "    Frontend already running on :$FRONTEND_PORT"
 else
   echo "    Starting frontend..."

@@ -3707,7 +3707,7 @@ func shouldInterruptAgent(status string, err error) bool {
 	if err != nil {
 		return isTaskNotFoundError(err)
 	}
-	return isAgentTaskTerminal(status)
+	return status == "cancellation_requested" || isAgentTaskTerminal(status)
 }
 
 // watchTaskCancellation polls the server for the task's status on the given
@@ -3732,6 +3732,11 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 			status, err := d.client.GetTaskStatus(ctx, taskID)
 			if !shouldInterruptAgent(status, err) {
 				return false
+			}
+			if err == nil && status == "cancellation_requested" {
+				if ackErr := d.client.AckTaskCancellationObserved(ctx, taskID); ackErr != nil {
+					taskLog.Warn("cancellation observation acknowledgement failed", "error", ackErr)
+				}
 			}
 			if err != nil {
 				taskLog.Info("task gone server-side, interrupting agent", "error", err)
@@ -3911,6 +3916,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// signals as the in-flight watcher.
 	if status, err := d.client.GetTaskStatus(ctx, task.ID); shouldInterruptAgent(status, err) {
 		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
+		if err == nil && status == "cancellation_requested" {
+			if ackErr := d.client.AckTaskCancellationObserved(ctx, task.ID); ackErr != nil {
+				taskLog.Warn("cancellation observation acknowledgement failed", "error", ackErr)
+			}
+		}
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization.
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
