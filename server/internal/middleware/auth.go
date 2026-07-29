@@ -11,11 +11,22 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func uuidToString(u pgtype.UUID) string { return util.UUIDToString(u) }
+
+func uuidStrings(values []pgtype.UUID) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value.Valid {
+			out = append(out, uuidToString(value))
+		}
+	}
+	return out
+}
 
 // Auth middleware validates JWT tokens or Personal Access Tokens.
 // Token sources (in priority order):
@@ -37,13 +48,14 @@ func uuidToString(u pgtype.UUID) string { return util.UUIDToString(u) }
 func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATVerifier) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// X-Actor-Source is server-set only — any value supplied by
-			// the client is untrusted and discarded before the auth
-			// branches run. Only the mat_ branch below re-sets it. This
-			// is what prevents a client from sending a normal mul_ PAT
-			// plus a forged `X-Actor-Source: member` (or anything else)
-			// to convince a downstream handler that its request came
-			// from a non-task-token path.
+			// Identity headers are compatibility outputs, never inputs. Strip every
+			// client value before authentication. Each successful branch installs a
+			// typed identity in request context; downstream authorization resolves
+			// only that context and cannot be reclassified with headers.
+			r.Header.Del("X-User-ID")
+			r.Header.Del("X-User-Email")
+			r.Header.Del("X-Agent-ID")
+			r.Header.Del("X-Task-ID")
 			r.Header.Del("X-Actor-Source")
 
 			tokenString, fromCookie := extractToken(r)
@@ -57,6 +69,72 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			if fromCookie && !auth.ValidateCSRF(r) {
 				slog.Debug("auth: CSRF validation failed", "path", r.URL.Path)
 				http.Error(w, `{"error":"CSRF validation failed"}`, http.StatusForbidden)
+				return
+			}
+
+			// Short-lived authorization sessions. The prefix selects only the
+			// lookup path; the server-side row remains authoritative for class,
+			// principal, scope, expiry, and revocation.
+			if strings.HasPrefix(tokenString, "mha_") || strings.HasPrefix(tokenString, "mhi_") {
+				if queries == nil {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				session, err := queries.GetAuthorizationSessionByHash(r.Context(), auth.HashToken(tokenString))
+				if err != nil {
+					slog.Warn("auth: invalid authorization session", "path", r.URL.Path, "error", err)
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+
+				isHarness := strings.HasPrefix(tokenString, "mha_")
+				expectedClass := string(requestidentity.CredentialHumanInteractive)
+				if isHarness {
+					expectedClass = string(requestidentity.CredentialHarnessSession)
+				}
+				if session.CredentialClass != expectedClass {
+					slog.Warn("auth: authorization session prefix/class mismatch", "path", r.URL.Path)
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+
+				userID := uuidToString(session.UserID)
+				sessionID := uuidToString(session.ID)
+				r.Header.Set("X-User-ID", userID)
+				if session.WorkspaceID.Valid {
+					r.Header.Set("X-Workspace-ID", uuidToString(session.WorkspaceID))
+				}
+				principalType := requestidentity.PrincipalMember
+				principalID := userID
+				credentialClass := requestidentity.CredentialHumanInteractive
+				if isHarness {
+					principalType = requestidentity.PrincipalHarness
+					principalID = sessionID
+					credentialClass = requestidentity.CredentialHarnessSession
+					r.Header.Set("X-Actor-Source", "harness_session")
+				}
+				id := requestidentity.RequestIdentity{
+					PrincipalType:            principalType,
+					PrincipalID:              principalID,
+					CredentialClass:          credentialClass,
+					UserID:                   userID,
+					WorkspaceID:              uuidToString(session.WorkspaceID),
+					SessionID:                sessionID,
+					ProjectID:                uuidToString(session.ProjectID),
+					IssueID:                  uuidToString(session.IssueID),
+					LineageID:                uuidToString(session.LineageID),
+					PolicyVersion:            session.PolicyVersion,
+					AllowedActions:           append([]string(nil), session.AllowedActions...),
+					ExplicitDenies:           append([]string(nil), session.ExplicitDenies...),
+					MaxDelegationDepth:       session.MaxDelegationDepth,
+					AllowedChildPrincipalIDs: uuidStrings(session.AllowedChildPrincipalIds),
+					CapabilityEnvelope:       true,
+					ExpiresAt:                session.ExpiresAt.Time,
+					AuthenticationAssurance:  session.AuthenticationAssurance,
+					AuthenticatedAt:          session.CreatedAt.Time,
+				}
+				go queries.TouchAuthorizationSession(context.Background(), session.ID)
+				next.ServeHTTP(w, r.WithContext(requestidentity.WithRequest(r.Context(), id)))
 				return
 			}
 
@@ -92,7 +170,26 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// this header is allowed to carry — strip anything else a
 				// client tried to send.
 				r.Header.Set("X-Actor-Source", "task_token")
-				next.ServeHTTP(w, r)
+				ctx := requestidentity.WithRequest(r.Context(), requestidentity.RequestIdentity{
+					PrincipalType:            requestidentity.PrincipalAgent,
+					PrincipalID:              uuidToString(tt.AgentID),
+					CredentialClass:          requestidentity.CredentialAgentTaskToken,
+					UserID:                   uuidToString(tt.UserID),
+					AgentID:                  uuidToString(tt.AgentID),
+					TaskID:                   uuidToString(tt.TaskID),
+					WorkspaceID:              uuidToString(tt.WorkspaceID),
+					ProjectID:                uuidToString(tt.ProjectID),
+					IssueID:                  uuidToString(tt.IssueID),
+					LineageID:                uuidToString(tt.LineageID),
+					SessionID:                uuidToString(tt.AuthorizationSessionID),
+					AllowedActions:           append([]string(nil), tt.AllowedActions...),
+					ExplicitDenies:           append([]string(nil), tt.ExplicitDenies...),
+					MaxDelegationDepth:       tt.DelegationDepthRemaining.Int32,
+					AllowedChildPrincipalIDs: uuidStrings(tt.AllowedChildPrincipalIds),
+					CapabilityEnvelope:       tt.CapabilityEnvelope,
+					ExpiresAt:                tt.ExpiresAt.Time,
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 
@@ -149,12 +246,18 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// treated as the owner having approved an account-
 				// level action.
 				r.Header.Set("X-Actor-Source", "cloud_pat")
-				next.ServeHTTP(w, r)
+				ctx := requestidentity.WithRequest(r.Context(), requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalRuntime,
+					CredentialClass: requestidentity.CredentialCloudNodePAT,
+					UserID:          identity.OwnerID,
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 
 			// PAT: tokens starting with "mul_"
 			if strings.HasPrefix(tokenString, "mul_") {
+				setAuthorizationExchangeWarning(w)
 				hash := auth.HashToken(tokenString)
 
 				// Cache hit: TTL has not expired, the token was valid the
@@ -163,7 +266,13 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// UPDATE — last_used_at is bumped once per TTL window.
 				if userID, ok := patCache.Get(r.Context(), hash); ok {
 					r.Header.Set("X-User-ID", userID)
-					next.ServeHTTP(w, r)
+					ctx := requestidentity.WithRequest(r.Context(), requestidentity.RequestIdentity{
+						PrincipalType:   requestidentity.PrincipalMember,
+						PrincipalID:     userID,
+						CredentialClass: requestidentity.CredentialLegacyPersonalToken,
+						UserID:          userID,
+					})
+					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 
@@ -195,11 +304,18 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// within the TTL window skip this write entirely.
 				go queries.UpdatePersonalAccessTokenLastUsed(context.Background(), pat.ID)
 
-				next.ServeHTTP(w, r)
+				ctx := requestidentity.WithRequest(r.Context(), requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalMember,
+					PrincipalID:     userID,
+					CredentialClass: requestidentity.CredentialLegacyPersonalToken,
+					UserID:          userID,
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 
 			// JWT
+			setAuthorizationExchangeWarning(w)
 			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
 				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 					return nil, jwt.ErrSignatureInvalid
@@ -226,13 +342,27 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				return
 			}
 			r.Header.Set("X-User-ID", sub)
+			id := requestidentity.RequestIdentity{
+				PrincipalType:   requestidentity.PrincipalMember,
+				PrincipalID:     sub,
+				CredentialClass: requestidentity.CredentialLegacyHumanSession,
+				UserID:          sub,
+			}
+			if issuedAt, err := claims.GetIssuedAt(); err == nil && issuedAt != nil {
+				id.AuthenticatedAt = issuedAt.Time
+			}
 			if email, ok := claims["email"].(string); ok {
 				r.Header.Set("X-User-Email", email)
 			}
 
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(requestidentity.WithRequest(r.Context(), id)))
 		})
 	}
+}
+
+func setAuthorizationExchangeWarning(w http.ResponseWriter) {
+	w.Header().Set("Warning", `299 Multica "Legacy credential will require authorization-session exchange for protected actions"`)
+	w.Header().Set("X-Multica-Authorization-Exchange", "/api/authorization/sessions/exchange")
 }
 
 // extractToken returns the bearer token and whether it came from a cookie.

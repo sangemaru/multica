@@ -2558,13 +2558,9 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		// validated against the DB. A member-forged X-Task-ID never reaches here
 		// because it would have resolved to creatorType=="member". We still
 		// re-check the task belongs to the acting agent before trusting it.
-		if taskIDHeader := r.Header.Get("X-Task-ID"); taskIDHeader != "" {
-			if taskUUID, perr := util.ParseUUID(taskIDHeader); perr == nil {
-				if task, terr := h.Queries.GetAgentTask(r.Context(), taskUUID); terr == nil && uuidToString(task.AgentID) == actualCreatorID {
-					originType = pgtype.Text{String: "agent_create", Valid: true}
-					originID = taskUUID
-				}
-			}
+		if task, ok := h.taskFromRequestIdentity(r); ok && uuidToString(task.AgentID) == actualCreatorID {
+			originType = pgtype.Text{String: "agent_create", Valid: true}
+			originID = task.ID
 		}
 	}
 
@@ -3124,16 +3120,8 @@ func (h *Handler) isAgentRunningOnIssue(r *http.Request, actorType string, issue
 	if actorType != "agent" {
 		return false
 	}
-	taskIDStr := r.Header.Get("X-Task-ID")
-	if taskIDStr == "" {
-		return false
-	}
-	taskUUID, err := util.ParseUUID(taskIDStr)
-	if err != nil {
-		return false
-	}
-	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil {
+	task, ok := h.taskFromRequestIdentity(r)
+	if !ok {
 		return false
 	}
 	if !task.IssueID.Valid {
@@ -3164,7 +3152,17 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+	if err := h.TaskService.CancelTasksForIssue(r.Context(), issue.ID); err != nil {
+		if errors.Is(err, service.ErrTaskTerminationPending) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "task_termination_pending",
+				"error": err.Error(),
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to cancel issue tasks")
+		return
+	}
 	// Fail any linked autopilot runs before delete (ON DELETE SET NULL clears issue_id).
 	h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
@@ -3540,7 +3538,10 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		if err := h.TaskService.CancelTasksForIssue(r.Context(), issue.ID); err != nil {
+			slog.Warn("batch delete issue deferred", "issue_id", issueID, "error", err)
+			continue
+		}
 		h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 		// Collect attachment URLs before CASCADE delete to clean up S3 objects.

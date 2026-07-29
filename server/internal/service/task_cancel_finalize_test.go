@@ -290,10 +290,10 @@ func TestCancelTask_NotStarted_RestoresDraftSynchronously(t *testing.T) {
 	}
 }
 
-// Cancelled after start with transcript rows already persisted: "non-empty"
-// is monotonic (late rows only append), so the Stopped. outcome stays
-// synchronous.
-func TestCancelTask_StartedNonEmptyTranscript_StopsSynchronously(t *testing.T) {
+// Cancellation after start is only a server denial/request. Even when the
+// transcript is already non-empty, the user-facing "Stopped." outcome waits
+// for the runtime to confirm that runner.run actually returned.
+func TestCancelTask_StartedNonEmptyTranscript_StopsAfterTerminationConfirmation(t *testing.T) {
 	ctx := context.Background()
 	pool := newCancelFinalizePool(t)
 	f := createCancelFinalizeFixture(t, ctx, pool, "running", true)
@@ -307,14 +307,24 @@ func TestCancelTask_StartedNonEmptyTranscript_StopsSynchronously(t *testing.T) {
 	if result.CancelledChatMessage != nil {
 		t.Fatalf("expected no restore result, got %+v", result.CancelledChatMessage)
 	}
-	if got := f.assistantMessages(t, ctx); len(got) != 1 || got[0] != "Stopped." {
-		t.Errorf("assistant messages = %v, want [Stopped.]", got)
+	if got := f.assistantMessages(t, ctx); len(got) != 0 {
+		t.Errorf("assistant messages before termination = %v, want none", got)
 	}
 	if !f.userMessageExists(t, ctx) {
 		t.Error("user chat message should be preserved")
 	}
+	if got := f.chatFinalizeDeferredAt(t, ctx); got == nil {
+		t.Error("chat_finalize_deferred_at should be set until termination")
+	}
+
+	if _, err := svc.ConfirmTaskTermination(ctx, util.MustParseUUID(f.taskID)); err != nil {
+		t.Fatalf("confirm task termination: %v", err)
+	}
+	if got := f.assistantMessages(t, ctx); len(got) != 1 || got[0] != "Stopped." {
+		t.Errorf("assistant messages after termination = %v, want [Stopped.]", got)
+	}
 	if got := f.chatFinalizeDeferredAt(t, ctx); got != nil {
-		t.Errorf("chat_finalize_deferred_at should stay NULL, got %v", got)
+		t.Errorf("chat_finalize_deferred_at should clear after termination, got %v", got)
 	}
 }
 

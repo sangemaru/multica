@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -244,8 +245,15 @@ func TestAgentEnv_AgentActorRejectedForOwnedAgent(t *testing.T) {
 				method = http.MethodPut
 			}
 			req := withURLParam(newRequestAs(ownerUserID, method, "/api/agents/"+targetID+"/env", tc.body), "id", targetID)
-			req.Header.Set("X-Agent-ID", hostAgentID)
-			req.Header.Set("X-Task-ID", hostTaskID)
+			req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+				PrincipalType:   requestidentity.PrincipalAgent,
+				PrincipalID:     hostAgentID,
+				CredentialClass: requestidentity.CredentialAgentTaskToken,
+				UserID:          ownerUserID,
+				AgentID:         hostAgentID,
+				TaskID:          hostTaskID,
+				WorkspaceID:     testWorkspaceID,
+			}))
 			w := httptest.NewRecorder()
 			tc.fn(w, req)
 			if w.Code != http.StatusForbidden {

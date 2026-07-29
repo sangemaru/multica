@@ -6,12 +6,11 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 )
 
 // TestRequireHumanActor_AllowsHumanRequest pins the happy path: a
-// request that passed Auth as a JWT or mul_ PAT does NOT carry
-// X-Actor-Source, so the guard lets it through and the inner handler
-// runs.
+// presence-checked human session reaches the protected endpoint.
 //
 // We construct a bare http.Handler chain (no full router) so the test
 // exercises only the middleware logic and is independent of any
@@ -26,7 +25,10 @@ func TestRequireHumanActor_AllowsHumanRequest(t *testing.T) {
 	mw := RequireHumanActor(next)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/cloud-billing/balance", nil)
-	// No X-Actor-Source — this is the JWT / mul_ PAT shape.
+	req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+		PrincipalType:   requestidentity.PrincipalMember,
+		CredentialClass: requestidentity.CredentialHumanInteractive,
+	}))
 	w := httptest.NewRecorder()
 	mw.ServeHTTP(w, req)
 
@@ -46,25 +48,27 @@ func TestRequireHumanActor_AllowsHumanRequest(t *testing.T) {
 // silently grant agents/nodes account-level access.
 func TestRequireHumanActor_BlocksMachineCredentials(t *testing.T) {
 	cases := []struct {
-		name        string
-		actorSource string
+		name            string
+		credentialClass requestidentity.CredentialClass
 	}{
 		// mat_ task token — set in middleware/auth.go's mat_ branch.
 		// An agent process holding its task-scoped token must not be
 		// able to read its owner's billing data.
-		{name: "task_token", actorSource: "task_token"},
+		{name: "task_token", credentialClass: requestidentity.CredentialAgentTaskToken},
 		// mcn_ cloud-node PAT — set in BOTH middleware/auth.go and
 		// middleware/daemon_auth.go's mcn_ branches. A cloud-runtime
 		// EC2 node operating on the owner's behalf is the same kind
 		// of machine credential as mat_ for billing-authorization
 		// purposes.
-		{name: "cloud_pat", actorSource: "cloud_pat"},
+		{name: "cloud_pat", credentialClass: requestidentity.CredentialCloudNodePAT},
+		{name: "daemon_token", credentialClass: requestidentity.CredentialDaemonToken},
+		{name: "harness_session", credentialClass: requestidentity.CredentialHarnessSession},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			next := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-				t.Fatalf("inner handler must NOT run for actor source %q", tc.actorSource)
+				t.Fatalf("inner handler must NOT run for credential class %q", tc.credentialClass)
 			})
 			mw := RequireHumanActor(next)
 
@@ -75,7 +79,10 @@ func TestRequireHumanActor_BlocksMachineCredentials(t *testing.T) {
 			// upstream context — the auth middlewares strip any
 			// client-supplied value before stamping their own, so a
 			// non-empty value at this point IS authoritative.
-			req.Header.Set("X-Actor-Source", tc.actorSource)
+			req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+				PrincipalType:   requestidentity.PrincipalRuntime,
+				CredentialClass: tc.credentialClass,
+			}))
 			w := httptest.NewRecorder()
 			mw.ServeHTTP(w, req)
 
@@ -86,31 +93,7 @@ func TestRequireHumanActor_BlocksMachineCredentials(t *testing.T) {
 	}
 }
 
-// TestRequireHumanActor_IgnoresUnknownActorSource pins the gate's
-// scope: it is an explicit denylist against the known-bad
-// "task_token" value, NOT an allowlist against "human only / empty".
-//
-// Why the denylist shape:
-//
-//   - The Auth middleware today sets X-Actor-Source for exactly one
-//     case: mat_ task tokens. Every other authenticated path (JWT,
-//     mul_ PAT) leaves the header empty. So "non-empty AND not
-//     task_token" is unreachable in current production.
-//
-//   - If a future actor kind is added (say a hypothetical
-//     `service_account` token), this gate's silence on the new value
-//     is a CONSCIOUS DECISION POINT, not an accident. The added auth
-//     branch is the right place to decide whether the new kind should
-//     be allowed at billing endpoints — and that decision belongs in
-//     a security review at the time, not in a default-deny rule here
-//     that pre-emptively shuts out hypothetical use cases we cannot
-//     reason about today.
-//
-// If you are reading this comment because a new actor kind needs to
-// reach billing or needs to be blocked from it, update
-// RequireHumanActor to handle the new kind explicitly (and update
-// this test's expectation accordingly).
-func TestRequireHumanActor_IgnoresUnknownActorSource(t *testing.T) {
+func TestRequireHumanActor_RejectsMissingTypedIdentity(t *testing.T) {
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -119,20 +102,37 @@ func TestRequireHumanActor_IgnoresUnknownActorSource(t *testing.T) {
 
 	mw := RequireHumanActor(next)
 
-	// A hypothetical future value the gate doesn't know about.
+	// A client header is never an authenticated identity.
 	req := httptest.NewRequest(http.MethodGet, "/api/cloud-billing/balance", nil)
 	req.Header.Set("X-Actor-Source", "future_kind")
 	w := httptest.NewRecorder()
 	mw.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 — gate should only block exact 'task_token'", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — forged actor header must not satisfy the allowlist", w.Code)
 	}
-	if !called {
-		t.Fatal("inner handler must run for unknown actor sources")
+	if called {
+		t.Fatal("inner handler must not run without typed human identity")
 	}
 }
 
+func TestRequireHumanActor_ObserveMigrationAllowsLegacyHuman(t *testing.T) {
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := RequireHumanActorWithEnforcement(false)(next)
+	req := httptest.NewRequest(http.MethodGet, "/api/cloud-billing/balance", nil)
+	req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+		PrincipalType: requestidentity.PrincipalMember, CredentialClass: requestidentity.CredentialLegacyPersonalToken,
+	}))
+	w := httptest.NewRecorder()
+	mw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !called {
+		t.Fatalf("migration compatibility status=%d called=%v", w.Code, called)
+	}
+}
 
 // TestRequireHumanActor_AppliedViaChiRouterUse pins the wiring side of
 // the contract: when the guard is attached to a chi route group via
@@ -152,7 +152,10 @@ func TestRequireHumanActor_AppliedViaChiRouterUse(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/billing/probe", nil)
-	req.Header.Set("X-Actor-Source", "task_token")
+	req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+		PrincipalType:   requestidentity.PrincipalAgent,
+		CredentialClass: requestidentity.CredentialAgentTaskToken,
+	}))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

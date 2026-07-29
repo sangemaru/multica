@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAsDefault, waitForPageText } from "./helpers";
+import { enableFeatureFlag, loginAsDefault, waitForPageText } from "./helpers";
 
 test.describe("Settings", () => {
   test("updating workspace name reflects in sidebar immediately", async ({
@@ -22,20 +22,18 @@ test.describe("Settings", () => {
     const newName = "Renamed WS " + Date.now();
     await nameInput.fill(newName);
 
-    // Save
-    await page.locator("button", { hasText: "Save" }).click();
-
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
-
-    // Sidebar should reflect the new name WITHOUT page refresh
-    await expect(page.getByRole("button", { name: new RegExp(newName) }).first()).toBeVisible();
+    // Details auto-save; the sidebar should reflect the new name without a
+    // button click or page refresh.
+    await expect(page.getByRole("button", { name: new RegExp(newName) }).first()).toBeVisible({
+      timeout: 10000,
+    });
 
     // Restore original name so other tests aren't affected
     await nameInput.clear();
     await nameInput.fill(originalName.trim());
-    await page.locator("button", { hasText: "Save" }).click();
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
-    await expect(page.getByRole("button", { name: new RegExp(originalName) }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: new RegExp(originalName) }).first()).toBeVisible({
+      timeout: 10000,
+    });
   });
 
   // Composio connect flow, fully mocked at the network boundary so it runs
@@ -46,6 +44,7 @@ test.describe("Settings", () => {
   test("connecting a Composio toolkit shows a toast and refreshes the list", async ({
     page,
   }) => {
+    await enableFeatureFlag(page, "composio_mcp_apps");
     const workspaceSlug = await loginAsDefault(page);
     const settingsUrl = `/${workspaceSlug}/settings?tab=integrations`;
 

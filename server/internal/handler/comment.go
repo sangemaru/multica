@@ -1327,37 +1327,35 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	// and the private-agent gate denies the wake (MUL-4015).
 	var sourceTaskID pgtype.UUID
 	if authorType == "agent" {
-		if taskIDHeader := r.Header.Get("X-Task-ID"); taskIDHeader != "" {
-			taskUUID, parseErr := util.ParseUUID(taskIDHeader)
-			if parseErr == nil {
-				task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-				if err == nil && task.IssueID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID) {
-					if task.TriggerCommentID.Valid {
-						if !taskCoversReplyParent(task, parentID) {
-							// Keep this error actionable for agents (MUL-4417 / GH #5266).
-							writeError(w, http.StatusConflict,
-								"comment-triggered tasks cannot create top-level comments; set parent_id (--parent) to "+uuidToString(task.TriggerCommentID)+" or a coalesced comment id")
-							return
-						}
-					}
-					noAction, checkErr := service.HasSquadLeaderNoActionEvaluationForTask(r.Context(), h.Queries, task)
-					if checkErr != nil {
-						slog.Warn("checking squad leader no_action evaluation failed", append(logger.RequestAttrs(r),
-							"error", checkErr,
-							"task_id", taskIDHeader,
-							"issue_id", issueID,
-						)...)
-					} else if noAction {
-						writeError(w, http.StatusConflict, "squad leader recorded no_action; comments are not allowed for this task")
+		if authenticatedTask, ok := h.taskFromRequestIdentity(r); ok && uuidToString(authenticatedTask.AgentID) == authorID {
+			task := authenticatedTask
+			taskUUID := task.ID
+			if task.IssueID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID) {
+				if task.TriggerCommentID.Valid {
+					if !taskCoversReplyParent(task, parentID) {
+						// Keep this error actionable for agents (MUL-4417 / GH #5266).
+						writeError(w, http.StatusConflict,
+							"comment-triggered tasks cannot create top-level comments; set parent_id (--parent) to "+uuidToString(task.TriggerCommentID)+" or a coalesced comment id")
 						return
 					}
-					// Only stamp source_task_id for a task belonging to THIS
-					// issue. An agent legitimately commenting on a DIFFERENT
-					// issue than its current task must not stamp that task's
-					// id here — the resulting chain would then attribute the
-					// out-of-band comment to an unrelated task's originator.
-					sourceTaskID = taskUUID
 				}
+				noAction, checkErr := service.HasSquadLeaderNoActionEvaluationForTask(r.Context(), h.Queries, task)
+				if checkErr != nil {
+					slog.Warn("checking squad leader no_action evaluation failed", append(logger.RequestAttrs(r),
+						"error", checkErr,
+						"task_id", uuidToString(task.ID),
+						"issue_id", issueID,
+					)...)
+				} else if noAction {
+					writeError(w, http.StatusConflict, "squad leader recorded no_action; comments are not allowed for this task")
+					return
+				}
+				// Only stamp source_task_id for a task belonging to THIS
+				// issue. An agent legitimately commenting on a DIFFERENT
+				// issue than its current task must not stamp that task's
+				// id here — the resulting chain would then attribute the
+				// out-of-band comment to an unrelated task's originator.
+				sourceTaskID = taskUUID
 			}
 		}
 	}
@@ -2727,6 +2725,13 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		}
 		cancelled, err = h.TaskService.CancelTasksByTriggerComment(r.Context(), existing.ID)
 		if err != nil {
+			if errors.Is(err, service.ErrTaskTerminationPending) {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"code":  "task_termination_pending",
+					"error": err.Error(),
+				})
+				return
+			}
 			slog.Warn("cancel tasks for edited comment failed", "comment_id", uuidToString(existing.ID), "error", err)
 			writeError(w, http.StatusInternalServerError, "failed to prepare comment edit")
 			return
@@ -2863,7 +2868,16 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	// otherwise nullify trigger_comment_id and orphan those tasks in queued.
 	cancelled, cancelErr := h.TaskService.CancelTasksByTriggerComment(r.Context(), comment.ID)
 	if cancelErr != nil {
+		if errors.Is(cancelErr, service.ErrTaskTerminationPending) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "task_termination_pending",
+				"error": cancelErr.Error(),
+			})
+			return
+		}
 		slog.Warn("cancel tasks for deleted trigger comment failed", append(logger.RequestAttrs(r), "error", cancelErr, "comment_id", commentId)...)
+		writeError(w, http.StatusInternalServerError, "failed to prepare comment deletion")
+		return
 	}
 
 	if err := h.Queries.DeleteComment(r.Context(), db.DeleteCommentParams{

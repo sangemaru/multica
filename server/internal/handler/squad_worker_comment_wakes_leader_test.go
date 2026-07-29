@@ -77,8 +77,7 @@ func TestCreateComment_WorkerAgentCommentWakesSquadLeader_MUL4015(t *testing.T) 
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "done — pushed the change, PR is up",
 	})
-	r.Header.Set("X-Agent-ID", fx.OtherID)
-	r.Header.Set("X-Task-ID", workerTaskID)
+	r = withAgentTaskIdentity(r, fx.OtherID, workerTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -151,8 +150,7 @@ func TestCreateComment_WorkerAgentCommentDoesNotWakeLeader_WhenLeaderTaskPending
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "done",
 	})
-	r.Header.Set("X-Agent-ID", fx.OtherID)
-	r.Header.Set("X-Task-ID", workerTaskID)
+	r = withAgentTaskIdentity(r, fx.OtherID, workerTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -282,8 +280,7 @@ func TestCreateComment_WorkerAgentCommentWakesPrivateSquadLeader_MUL4015(t *test
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "[@Worker](mention://agent/" + workerID + ") please handle",
 	})
-	r.Header.Set("X-Agent-ID", leaderID)
-	r.Header.Set("X-Task-ID", leaderTaskID)
+	r = withAgentTaskIdentity(r, leaderID, leaderTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -337,8 +334,7 @@ func TestCreateComment_WorkerAgentCommentWakesPrivateSquadLeader_MUL4015(t *test
 		"content":   "done — pushed the change",
 		"parent_id": workerTriggerCommentID,
 	})
-	r.Header.Set("X-Agent-ID", workerID)
-	r.Header.Set("X-Task-ID", workerTaskID)
+	r = withAgentTaskIdentity(r, workerID, workerTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {

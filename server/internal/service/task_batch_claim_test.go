@@ -69,11 +69,14 @@ func batchClaimFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (r
 			RETURNING id`, workspaceID, fmt.Sprintf("batch issue %d", n), userID, 800000+n, n).Scan(&issueID); err != nil {
 			t.Fatalf("create issue %d: %v", n, err)
 		}
-		if _, err := pool.Exec(ctx, `
+		var taskID string
+		if err := pool.QueryRow(ctx, `
 			INSERT INTO agent_task_queue (agent_id, issue_id, status, priority, context, runtime_id)
-			VALUES ($1, $2, 'queued', 0, '{}'::jsonb, $3)`, agentID, issueID, runtimeID); err != nil {
+			VALUES ($1, $2, 'queued', 0, '{}'::jsonb, $3)
+			RETURNING id`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
 			t.Fatalf("create task %d: %v", n, err)
 		}
+		authorizeTaskForClaim(t, pool, taskID)
 		// Space out created_at so ordering is deterministic.
 		time.Sleep(2 * time.Millisecond)
 	}

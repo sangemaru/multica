@@ -170,6 +170,13 @@ func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
 		return
 	}
+	if errors.Is(err, service.ErrTaskTerminationPending) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  "task_termination_pending",
+			"error": err.Error(),
+		})
+		return
+	}
 	if err != nil {
 		slog.Warn("issue rerun failed", "issue_id", id, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())

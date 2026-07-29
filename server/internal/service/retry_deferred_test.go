@@ -39,6 +39,7 @@ func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 	`, agentID, runtimeID, issueID).Scan(&parentID); err != nil {
 		t.Fatalf("insert parent task: %v", err)
 	}
+	authorizeTaskForClaim(t, pool, parentID)
 	t.Cleanup(func() {
 		pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE parent_task_id = $1 OR id = $1`, parentID)
 	})
@@ -128,6 +129,7 @@ func TestFailTaskProviderNetworkBudget(t *testing.T) {
 			`, agentID, runtimeID, issueID, tc.attempt, tc.maxAttempts).Scan(&parentID); err != nil {
 				t.Fatalf("insert parent task: %v", err)
 			}
+			authorizeTaskForClaim(t, pool, parentID)
 			t.Cleanup(func() {
 				pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE parent_task_id = $1 OR id = $1`, parentID)
 			})

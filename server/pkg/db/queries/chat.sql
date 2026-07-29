@@ -350,7 +350,7 @@ INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, chat_session_id,
     initiator_user_id, originator_user_id, accountable_user_id, force_fresh_session, runtime_mcp_overlay,
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
-    fire_at
+    fire_at, admission_decision_id, authorization_policy_version, lineage_id, budget_reservation_id
 )
 VALUES (
     $1, $2, NULL,
@@ -364,7 +364,8 @@ VALUES (
     sqlc.narg(originator_source),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
-    sqlc.narg('fire_at')::timestamptz
+    sqlc.narg('fire_at')::timestamptz,
+    @admission_decision_id, @authorization_policy_version, @lineage_id, @budget_reservation_id
 )
 RETURNING *;
 

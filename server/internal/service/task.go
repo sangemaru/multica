@@ -12,13 +12,16 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/admission"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/featureflags"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
@@ -56,10 +59,346 @@ type TaskService struct {
 	// exactly as before. Wired in router.go after composiointeg.NewService
 	// succeeds; the concrete type is *composio.Service.
 	Composio ComposioOverlayBuilder
+	// Admission is the one evaluator used by every task-creation path. Nil is
+	// migration-stage-1 compatibility mode, not a bypass: AdmitTask substitutes
+	// the typed compatibility evaluator and still validates the path inventory.
+	Admission admission.Evaluator
 
 	analyticsContextMu    sync.Mutex
 	analyticsContextCache map[string]analytics.TaskContext
 	analyticsContextOrder []string
+}
+
+// AdmitTask is the single pre-dispatch authorization choke point. Callers pass
+// only opaque resource identifiers; authenticated identity is filled from
+// request context when the caller did not provide an internal principal.
+func (s *TaskService) AdmitTask(ctx context.Context, req admission.Request) (admission.Decision, error) {
+	if !admission.ValidPath(req.Path) {
+		return admission.Decision{}, admission.ErrUnknownPath
+	}
+	if req.Identity.CredentialClass == "" {
+		if id, ok := requestidentity.FromContext(ctx); ok {
+			req.Identity = id
+		}
+	}
+	if req.Action == "" {
+		req.Action = admission.ActionAgentInvoke
+		if isMachineDelegation(req.Identity, req.AgentID) {
+			req.Action = admission.ActionAgentDelegate
+		}
+	}
+	if !admission.ValidAction(req.Action) {
+		return admission.Decision{}, admission.ErrUnknownAction
+	}
+	lineageID, err := s.resolveAdmissionLineage(ctx, req)
+	if err != nil {
+		return admission.Decision{}, err
+	}
+	req.Identity.LineageID = lineageID
+	evaluator := s.Admission
+	if evaluator == nil {
+		if s.Queries != nil {
+			evaluator = admission.NewObserveOnlyEvaluator(s.Queries, nil)
+		} else {
+			evaluator = admission.CompatibilityEvaluator{}
+		}
+	}
+	decision, err := evaluator.Evaluate(ctx, req)
+	if err != nil {
+		return decision, err
+	}
+	if !decision.Allowed && !decision.ObserveOnly {
+		return decision, admission.ErrDenied
+	}
+	if s.Queries == nil {
+		return decision, nil
+	}
+	if _, err := s.Queries.ReleaseExpiredAuthorizationBudgetReservations(ctx); err != nil {
+		return admission.Decision{}, fmt.Errorf("release expired lineage budget reservations: %w", err)
+	}
+	reservation, err := s.Queries.ReserveAuthorizationLineageBudget(ctx, db.ReserveAuthorizationLineageBudgetParams{
+		LineageID:           nullableTaskUUID(decision.LineageID),
+		WorkspaceID:         nullableTaskUUID(req.WorkspaceID),
+		ExecutionLimit:      defaultAuthorizationLineageExecutionLimit,
+		AdmissionDecisionID: nullableTaskUUID(decision.ID),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		req.PreconditionFailure = "lineage_execution_budget_exhausted"
+		denied, denyErr := evaluator.Evaluate(ctx, req)
+		if denyErr != nil {
+			return admission.Decision{}, fmt.Errorf("persist lineage budget denial: %w", denyErr)
+		}
+		return denied, admission.ErrDenied
+	}
+	if err != nil {
+		return admission.Decision{}, fmt.Errorf("reserve lineage execution budget: %w", err)
+	}
+	decision.BudgetReservationID = util.UUIDToString(reservation.ID)
+	return decision, nil
+}
+
+const defaultAuthorizationLineageExecutionLimit int32 = 64
+
+func isMachineDelegation(id requestidentity.RequestIdentity, targetAgentID string) bool {
+	if targetAgentID == "" {
+		return false
+	}
+	return id.CredentialClass == requestidentity.CredentialAgentTaskToken &&
+		id.AgentID != "" && id.AgentID != targetAgentID
+}
+
+func (s *TaskService) resolveAdmissionLineage(ctx context.Context, req admission.Request) (string, error) {
+	if req.Identity.LineageID != "" {
+		if _, err := uuid.Parse(req.Identity.LineageID); err != nil {
+			return "", fmt.Errorf("invalid admission lineage: %w", err)
+		}
+		return req.Identity.LineageID, nil
+	}
+
+	sourceTaskID := req.ParentTaskID
+	if sourceTaskID == "" {
+		sourceTaskID = req.Identity.TaskID
+	}
+	if sourceTaskID == "" {
+		return uuid.NewString(), nil
+	}
+	if s.Queries == nil {
+		return "", fmt.Errorf("resolve admission lineage: task store unavailable")
+	}
+	source, err := s.Queries.GetAgentTask(ctx, nullableTaskUUID(sourceTaskID))
+	if err != nil {
+		return "", fmt.Errorf("resolve admission lineage from task: %w", err)
+	}
+	if !source.LineageID.Valid {
+		return "", fmt.Errorf("resolve admission lineage from task: source task has no authorization lineage")
+	}
+	return util.UUIDToString(source.LineageID), nil
+}
+
+func nullableTaskUUID(value string) pgtype.UUID {
+	parsed, err := util.ParseUUID(value)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	return parsed
+}
+
+type taskAuthorizationMetadata struct {
+	decisionID          pgtype.UUID
+	policyVersion       pgtype.Text
+	lineageID           pgtype.UUID
+	budgetReservationID pgtype.UUID
+}
+
+func metadataFromAdmission(decision admission.Decision) (taskAuthorizationMetadata, error) {
+	decisionID, err := util.ParseUUID(decision.ID)
+	if err != nil {
+		return taskAuthorizationMetadata{}, fmt.Errorf("invalid admission decision id: %w", err)
+	}
+	lineageID, err := util.ParseUUID(decision.LineageID)
+	if err != nil {
+		return taskAuthorizationMetadata{}, fmt.Errorf("invalid admission lineage id: %w", err)
+	}
+	if decision.PolicyVersion == "" {
+		return taskAuthorizationMetadata{}, fmt.Errorf("admission decision has no policy version")
+	}
+	budgetReservationID, err := util.ParseUUID(decision.BudgetReservationID)
+	if err != nil {
+		return taskAuthorizationMetadata{}, fmt.Errorf("admission decision has no budget reservation: %w", err)
+	}
+	return taskAuthorizationMetadata{
+		decisionID:          decisionID,
+		policyVersion:       pgtype.Text{String: decision.PolicyVersion, Valid: true},
+		lineageID:           lineageID,
+		budgetReservationID: budgetReservationID,
+	}, nil
+}
+
+func (s *TaskService) releaseUnboundAdmissionBudget(ctx context.Context, authorization taskAuthorizationMetadata, reason string) {
+	if s == nil || s.Queries == nil || !authorization.budgetReservationID.Valid {
+		return
+	}
+	_, err := s.Queries.ReleaseAuthorizationBudgetReservation(ctx, db.ReleaseAuthorizationBudgetReservationParams{
+		ReservationID: authorization.budgetReservationID,
+		ReasonCode:    pgtype.Text{String: reason, Valid: reason != ""},
+	})
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("release unbound authorization budget reservation", "reservation_id", util.UUIDToString(authorization.budgetReservationID), "error", err)
+	}
+}
+
+func (s *TaskService) evaluatorForTransaction(qtx *db.Queries) (*admission.ObserveOnlyEvaluator, error) {
+	if s.Admission == nil {
+		return admission.NewObserveOnlyEvaluator(qtx, nil), nil
+	}
+	evaluator, ok := s.Admission.(*admission.ObserveOnlyEvaluator)
+	if !ok {
+		return nil, fmt.Errorf("authorization evaluator does not support transaction-scoped decisions")
+	}
+	return evaluator.WithStore(qtx), nil
+}
+
+func (s *TaskService) reauthorizeTask(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue, phase string) (admission.Decision, error) {
+	agent, err := qtx.GetAgent(ctx, task.AgentID)
+	if err != nil {
+		return admission.Decision{}, fmt.Errorf("load claim agent scope: %w", err)
+	}
+
+	req := admission.Request{
+		Path:        admissionPathForTask(task),
+		Phase:       phase,
+		Action:      admission.ActionAgentInvoke,
+		WorkspaceID: util.UUIDToString(agent.WorkspaceID),
+		IssueID:     util.UUIDToString(task.IssueID),
+		AgentID:     util.UUIDToString(task.AgentID),
+		TaskID:      util.UUIDToString(task.ID),
+		Identity: requestidentity.RequestIdentity{
+			LineageID: util.UUIDToString(task.LineageID),
+		},
+	}
+	if task.IssueID.Valid {
+		issue, issueErr := qtx.GetIssue(ctx, task.IssueID)
+		if issueErr != nil {
+			if !errors.Is(issueErr, pgx.ErrNoRows) {
+				return admission.Decision{}, fmt.Errorf("load claim project scope: %w", issueErr)
+			}
+			req.PreconditionFailure = "authorization_resource_missing"
+		} else {
+			req.ProjectID = util.UUIDToString(issue.ProjectID)
+		}
+	}
+	actualProjectID := req.ProjectID
+
+	if !task.AdmissionDecisionID.Valid || !task.AuthorizationPolicyVersion.Valid || !task.LineageID.Valid {
+		req.PreconditionFailure = "task_authorization_metadata_missing"
+		return s.evaluateTaskAuthorization(ctx, qtx, req)
+	}
+	if !task.BudgetReservationID.Valid {
+		req.PreconditionFailure = "task_budget_reservation_missing"
+		return s.evaluateTaskAuthorization(ctx, qtx, req)
+	}
+	reservation, err := qtx.GetAuthorizationBudgetReservation(ctx, task.BudgetReservationID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			req.PreconditionFailure = "task_budget_reservation_missing"
+			return s.evaluateTaskAuthorization(ctx, qtx, req)
+		}
+		return admission.Decision{}, fmt.Errorf("load task budget reservation: %w", err)
+	}
+	validReservationState := reservation.Status == "reserved"
+	if phase == "reclaim" {
+		validReservationState = validReservationState || reservation.Status == "consumed"
+	}
+	if !validReservationState ||
+		!sameOptionalUUID(reservation.LineageID, task.LineageID) ||
+		!sameOptionalUUID(reservation.AdmissionDecisionID, task.AdmissionDecisionID) ||
+		!sameOptionalUUID(reservation.TaskID, task.ID) {
+		req.PreconditionFailure = "task_budget_reservation_invalid"
+		return s.evaluateTaskAuthorization(ctx, qtx, req)
+	}
+
+	original, err := qtx.GetAuthorizationDecision(ctx, task.AdmissionDecisionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			req.PreconditionFailure = "admission_decision_missing"
+			return s.evaluateTaskAuthorization(ctx, qtx, req)
+		}
+		return admission.Decision{}, fmt.Errorf("load admission decision: %w", err)
+	}
+
+	req.Path = admission.Path(original.Path)
+	req.Action = admission.Action(original.Action)
+	if actualProjectID == "" {
+		actualProjectID = util.UUIDToString(original.ProjectID)
+	}
+	req.ProjectID = actualProjectID
+	req.ParentTaskID = util.UUIDToString(original.ParentTaskID)
+	req.Identity = requestidentity.RequestIdentity{
+		PrincipalType:            requestidentity.PrincipalType(original.PrincipalType),
+		PrincipalID:              util.UUIDToString(original.PrincipalID),
+		CredentialClass:          requestidentity.CredentialClass(original.CredentialClass),
+		SessionID:                util.UUIDToString(original.SessionID),
+		LineageID:                util.UUIDToString(task.LineageID),
+		AllowedActions:           append([]string(nil), original.AllowedActions...),
+		ExplicitDenies:           append([]string(nil), original.ExplicitDenies...),
+		MaxDelegationDepth:       original.DelegationDepthRemaining.Int32,
+		AllowedChildPrincipalIDs: authorizationUUIDStrings(original.AllowedChildPrincipalIds),
+		CapabilityEnvelope:       original.CapabilityEnvelope,
+	}
+
+	if original.EvaluationPhase != "admission" ||
+		original.PolicyVersion != task.AuthorizationPolicyVersion.String ||
+		!sameOptionalUUID(original.AgentID, task.AgentID) ||
+		!sameOptionalUUID(original.IssueID, task.IssueID) ||
+		!sameOptionalUUID(original.LineageID, task.LineageID) ||
+		!sameOptionalUUID(original.WorkspaceID, agent.WorkspaceID) ||
+		(task.IssueID.Valid && util.UUIDToString(original.ProjectID) != actualProjectID) {
+		req.PreconditionFailure = "task_authorization_metadata_mismatch"
+	}
+
+	if original.SessionID.Valid && req.PreconditionFailure == "" &&
+		(original.CredentialClass == string(requestidentity.CredentialHarnessSession) ||
+			original.CredentialClass == string(requestidentity.CredentialHumanInteractive)) {
+		session, sessionErr := qtx.GetActiveAuthorizationSessionByID(ctx, original.SessionID)
+		if sessionErr != nil {
+			if !errors.Is(sessionErr, pgx.ErrNoRows) {
+				return admission.Decision{}, fmt.Errorf("load active authorization session: %w", sessionErr)
+			}
+			req.PreconditionFailure = "authorization_session_inactive"
+		} else if session.CredentialClass != original.CredentialClass || !sameOptionalUUID(session.LineageID, task.LineageID) {
+			req.PreconditionFailure = "authorization_session_scope_drift"
+		} else {
+			req.Identity.UserID = util.UUIDToString(session.UserID)
+			req.Identity.WorkspaceID = util.UUIDToString(session.WorkspaceID)
+			req.Identity.ProjectID = util.UUIDToString(session.ProjectID)
+			req.Identity.IssueID = util.UUIDToString(session.IssueID)
+			req.Identity.PolicyVersion = session.PolicyVersion
+			req.Identity.AllowedActions = append([]string(nil), session.AllowedActions...)
+			req.Identity.ExplicitDenies = append([]string(nil), session.ExplicitDenies...)
+			req.Identity.MaxDelegationDepth = session.MaxDelegationDepth
+			req.Identity.AllowedChildPrincipalIDs = authorizationUUIDStrings(session.AllowedChildPrincipalIds)
+			req.Identity.CapabilityEnvelope = true
+			req.Identity.ExpiresAt = session.ExpiresAt.Time
+			req.Identity.AuthenticationAssurance = session.AuthenticationAssurance
+		}
+	}
+
+	return s.evaluateTaskAuthorization(ctx, qtx, req)
+}
+
+func (s *TaskService) evaluateTaskAuthorization(ctx context.Context, qtx *db.Queries, req admission.Request) (admission.Decision, error) {
+	evaluator, err := s.evaluatorForTransaction(qtx)
+	if err != nil {
+		return admission.Decision{}, err
+	}
+	return evaluator.Evaluate(ctx, req)
+}
+
+func admissionPathForTask(task db.AgentTaskQueue) admission.Path {
+	switch {
+	case task.ChatSessionID.Valid:
+		return admission.PathChat
+	case task.AutopilotRunID.Valid:
+		return admission.PathAutopilot
+	case task.IssueID.Valid:
+		return admission.PathIssueAssignee
+	default:
+		return admission.PathQuickCreate
+	}
+}
+
+func sameOptionalUUID(a, b pgtype.UUID) bool {
+	return a.Valid == b.Valid && (!a.Valid || a.Bytes == b.Bytes)
+}
+
+func authorizationUUIDStrings(values []pgtype.UUID) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value.Valid {
+			out = append(out, util.UUIDToString(value))
+		}
+	}
+	return out
 }
 
 // ComposioOverlayBuilder is the seam TaskService uses to build the per-task
@@ -1029,31 +1368,55 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	path := admission.PathIssueAssignee
+	if rerunOfTaskID.Valid {
+		path = admission.PathRerun
+	}
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:         path,
+		WorkspaceID:  util.UUIDToString(issue.WorkspaceID),
+		ProjectID:    util.UUIDToString(issue.ProjectID),
+		IssueID:      util.UUIDToString(issue.ID),
+		AgentID:      util.UUIDToString(issue.AssigneeID),
+		ParentTaskID: util.UUIDToString(rerunOfTaskID),
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit issue task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit issue task: %w", err)
+	}
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-		AgentID:              issue.AssigneeID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
-		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
-		OriginatorUserID:     originatorUserID,
-		AccountableUserID:    attr.AccountableUserID,
-		RuleVersionID:        attr.RuleVersionID,
-		RerunOfTaskID:        rerunOfTaskID,
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+		AgentID:                    issue.AssigneeID,
+		RuntimeID:                  agent.RuntimeID,
+		IssueID:                    issue.ID,
+		Priority:                   priorityToInt(issue.Priority),
+		TriggerCommentID:           triggerCommentID,
+		CoalescedCommentIds:        coalescedCommentIDs,
+		TriggerSummary:             s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		ForceFreshSession:          pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
+		HandoffNote:                pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
+		OriginatorUserID:           originatorUserID,
+		AccountableUserID:          attr.AccountableUserID,
+		RuleVersionID:              attr.RuleVersionID,
+		RerunOfTaskID:              rerunOfTaskID,
+		RuntimeMcpOverlay:          runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:       runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:           attrSource,
+		DelegatedFromTaskID:        attrDelegatedFrom,
+		TriggerEvidenceKind:        attrEvidenceKind,
+		TriggerEvidenceRefID:       attrEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	})
 	if err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
 	}
@@ -1146,33 +1509,60 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	path := admission.PathMention
+	if isLeader {
+		path = admission.PathSquadLeader
+	}
+	if rerunOfTaskID.Valid {
+		path = admission.PathRerun
+	}
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:         path,
+		WorkspaceID:  util.UUIDToString(issue.WorkspaceID),
+		ProjectID:    util.UUIDToString(issue.ProjectID),
+		IssueID:      util.UUIDToString(issue.ID),
+		AgentID:      util.UUIDToString(agentID),
+		ParentTaskID: util.UUIDToString(rerunOfTaskID),
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit mention task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit mention task: %w", err)
+	}
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-		AgentID:              agentID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
-		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
-		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
-		SquadID:              squadID,
-		OriginatorUserID:     originatorUserID,
-		AccountableUserID:    attr.AccountableUserID,
-		RuleVersionID:        attr.RuleVersionID,
-		RerunOfTaskID:        rerunOfTaskID,
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+		AgentID:                    agentID,
+		RuntimeID:                  agent.RuntimeID,
+		IssueID:                    issue.ID,
+		Priority:                   priorityToInt(issue.Priority),
+		TriggerCommentID:           triggerCommentID,
+		CoalescedCommentIds:        coalescedCommentIDs,
+		TriggerSummary:             s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		IsLeaderTask:               pgtype.Bool{Bool: isLeader, Valid: isLeader},
+		ForceFreshSession:          pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
+		HandoffNote:                pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
+		SquadID:                    squadID,
+		OriginatorUserID:           originatorUserID,
+		AccountableUserID:          attr.AccountableUserID,
+		RuleVersionID:              attr.RuleVersionID,
+		RerunOfTaskID:              rerunOfTaskID,
+		RuntimeMcpOverlay:          runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:       runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:           attrSource,
+		DelegatedFromTaskID:        attrDelegatedFrom,
+		TriggerEvidenceKind:        attrEvidenceKind,
+		TriggerEvidenceRefID:       attrEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	})
 	if err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
 		// already covers this target — so log it at debug and return a typed
@@ -1227,25 +1617,45 @@ func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue
 	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	isLeader := squadID.Valid
-	task, err := s.Queries.CreateDeferredAgentTask(ctx, db.CreateDeferredAgentTaskParams{
-		AgentID:              agentID,
-		RuntimeID:            agent.RuntimeID,
-		IssueID:              issue.ID,
-		Priority:             priorityToInt(issue.Priority),
-		TriggerCommentID:     triggerCommentID,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
-		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
-		SquadID:              squadID,
-		EscalationForTaskID:  escalationForTaskID,
-		FireAt:               pgtype.Timestamptz{Time: fireAt, Valid: true},
-		OriginatorUserID:     attr.UserID,
-		AccountableUserID:    attr.AccountableUserID,
-		OriginatorSource:     attrSource,
-		DelegatedFromTaskID:  attrDelegatedFrom,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:         admission.PathDeferredFallback,
+		WorkspaceID:  util.UUIDToString(issue.WorkspaceID),
+		ProjectID:    util.UUIDToString(issue.ProjectID),
+		IssueID:      util.UUIDToString(issue.ID),
+		AgentID:      util.UUIDToString(agentID),
+		ParentTaskID: util.UUIDToString(escalationForTaskID),
 	})
 	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit deferred fallback task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit deferred fallback task: %w", err)
+	}
+	task, err := s.Queries.CreateDeferredAgentTask(ctx, db.CreateDeferredAgentTaskParams{
+		AgentID:                    agentID,
+		RuntimeID:                  agent.RuntimeID,
+		IssueID:                    issue.ID,
+		Priority:                   priorityToInt(issue.Priority),
+		TriggerCommentID:           triggerCommentID,
+		TriggerSummary:             s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		IsLeaderTask:               pgtype.Bool{Bool: isLeader, Valid: isLeader},
+		SquadID:                    squadID,
+		EscalationForTaskID:        escalationForTaskID,
+		FireAt:                     pgtype.Timestamptz{Time: fireAt, Valid: true},
+		OriginatorUserID:           attr.UserID,
+		AccountableUserID:          attr.AccountableUserID,
+		OriginatorSource:           attrSource,
+		DelegatedFromTaskID:        attrDelegatedFrom,
+		TriggerEvidenceKind:        attrEvidenceKind,
+		TriggerEvidenceRefID:       attrEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
+	})
+	if err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		slog.Error("deferred fallback enqueue failed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create deferred task: %w", err)
 	}
@@ -1375,20 +1785,38 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	}
 	attrSource, _, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, requesterID, agent)
-	task, err := s.Queries.CreateQuickCreateTask(ctx, db.CreateQuickCreateTaskParams{
-		AgentID:              agentID,
-		RuntimeID:            agent.RuntimeID,
-		Priority:             priorityToInt("high"),
-		Context:              contextJSON,
-		OriginatorUserID:     requesterID,
-		AccountableUserID:    attr.AccountableUserID,
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:        admission.PathQuickCreate,
+		WorkspaceID: util.UUIDToString(workspaceID),
+		ProjectID:   util.UUIDToString(projectID),
+		AgentID:     util.UUIDToString(agentID),
 	})
 	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit quick-create task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit quick-create task: %w", err)
+	}
+	task, err := s.Queries.CreateQuickCreateTask(ctx, db.CreateQuickCreateTaskParams{
+		AgentID:                    agentID,
+		RuntimeID:                  agent.RuntimeID,
+		Priority:                   priorityToInt("high"),
+		Context:                    contextJSON,
+		OriginatorUserID:           requesterID,
+		AccountableUserID:          attr.AccountableUserID,
+		RuntimeMcpOverlay:          runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:       runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:           attrSource,
+		TriggerEvidenceKind:        attrEvidenceKind,
+		TriggerEvidenceRefID:       attrEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
+	})
+	if err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		return db.AgentTaskQueue{}, fmt.Errorf("create quick-create task: %w", err)
 	}
 
@@ -1482,6 +1910,24 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 	}
 	attrSource, _, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, initiatorUserID, agent)
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:        admission.PathChat,
+		WorkspaceID: util.UUIDToString(agent.WorkspaceID),
+		AgentID:     util.UUIDToString(chatSession.AgentID),
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit chat task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("admit chat task: %w", err)
+	}
+	budgetBound := false
+	defer func() {
+		if !budgetBound {
+			s.releaseUnboundAdmissionBudget(ctx, authorization, "task_transaction_rolled_back")
+		}
+	}()
 
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
@@ -1510,11 +1956,15 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 			Bool:  forceFreshSession,
 			Valid: true,
 		},
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
-		OriginatorSource:     attrSource,
-		TriggerEvidenceKind:  attrEvidenceKind,
-		TriggerEvidenceRefID: attrEvidenceRef,
+		RuntimeMcpOverlay:          runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:       runtimeMCPOverlay.ConnectedApps,
+		OriginatorSource:           attrSource,
+		TriggerEvidenceKind:        attrEvidenceKind,
+		TriggerEvidenceRefID:       attrEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
 	})
 	if err != nil {
 		slog.Error("chat task enqueue failed", "chat_session_id", util.UUIDToString(chatSession.ID), "error", err)
@@ -1543,6 +1993,7 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 	if err := tx.Commit(ctx); err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("commit chat task enqueue: %w", err)
 	}
+	budgetBound = true
 
 	if task.Status == "deferred" {
 		slog.Info("chat task deferred for channel media",
@@ -1632,6 +2083,18 @@ func (s *TaskService) SendDirectChatMessage(ctx context.Context, session db.Chat
 		return nil, err
 	}
 	attrSource, _, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:        admission.PathDirectChat,
+		WorkspaceID: util.UUIDToString(agent.WorkspaceID),
+		AgentID:     util.UUIDToString(session.AgentID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("admit direct chat task: %w", err)
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return nil, fmt.Errorf("admit direct chat task: %w", err)
+	}
 
 	var out DirectChatSendResult
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
@@ -1655,19 +2118,23 @@ func (s *TaskService) SendDirectChatMessage(ctx context.Context, session db.Chat
 		}
 
 		task, err := qtx.CreateChatTask(ctx, db.CreateChatTaskParams{
-			AgentID:              session.AgentID,
-			RuntimeID:            carrier.RuntimeID,
-			Priority:             2, // medium priority for chat; matches EnqueueChatTask
-			ChatSessionID:        session.ID,
-			InitiatorUserID:      initiatorUserID,
-			OriginatorUserID:     attr.UserID,
-			AccountableUserID:    attr.AccountableUserID,
-			ForceFreshSession:    pgtype.Bool{Bool: false, Valid: true},
-			RuntimeMcpOverlay:    overlay.Overlay,
-			RuntimeConnectedApps: overlay.ConnectedApps,
-			OriginatorSource:     attrSource,
-			TriggerEvidenceKind:  attrEvidenceKind,
-			TriggerEvidenceRefID: attrEvidenceRef,
+			AgentID:                    session.AgentID,
+			RuntimeID:                  carrier.RuntimeID,
+			Priority:                   2, // medium priority for chat; matches EnqueueChatTask
+			ChatSessionID:              session.ID,
+			InitiatorUserID:            initiatorUserID,
+			OriginatorUserID:           attr.UserID,
+			AccountableUserID:          attr.AccountableUserID,
+			ForceFreshSession:          pgtype.Bool{Bool: false, Valid: true},
+			RuntimeMcpOverlay:          overlay.Overlay,
+			RuntimeConnectedApps:       overlay.ConnectedApps,
+			OriginatorSource:           attrSource,
+			TriggerEvidenceKind:        attrEvidenceKind,
+			TriggerEvidenceRefID:       attrEvidenceRef,
+			AdmissionDecisionID:        authorization.decisionID,
+			AuthorizationPolicyVersion: authorization.policyVersion,
+			LineageID:                  authorization.lineageID,
+			BudgetReservationID:        authorization.budgetReservationID,
 		})
 		if err != nil {
 			return fmt.Errorf("create direct chat task: %w", err)
@@ -1713,6 +2180,7 @@ func (s *TaskService) SendDirectChatMessage(ctx context.Context, session db.Chat
 		}
 		return nil
 	}); err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_transaction_rolled_back")
 		slog.Error("direct chat send failed",
 			"chat_session_id", util.UUIDToString(session.ID),
 			"agent_id", util.UUIDToString(session.AgentID),
@@ -1730,9 +2198,18 @@ func (s *TaskService) SendDirectChatMessage(ctx context.Context, session db.Chat
 	return &out, nil
 }
 
-// CancelTasksForIssue cancels every active task on the issue, reconciles each
-// affected agent's status, and broadcasts task:cancelled events so frontends
-// clear their live cards.
+// ErrTaskTerminationPending means server-mediated access has been denied and a
+// cancellation request has been recorded, but at least one host process has
+// not yet returned. Destructive callers must wait and retry.
+var ErrTaskTerminationPending = errors.New("task cancellation requested; host termination not yet confirmed")
+
+func taskTerminationPending(task db.AgentTaskQueue) bool {
+	return task.CancellationRequestedAt.Valid && !task.TerminationConfirmedAt.Valid
+}
+
+// CancelTasksForIssue requests cancellation for every active task on the
+// issue. Pre-start work terminates immediately; started work remains running
+// until its runtime confirms process termination.
 //
 // Callers are explicit issue-lifecycle cleanup paths only — DeleteIssue and
 // BatchDeleteIssues, where the owning issue row is going away so its tasks
@@ -1745,40 +2222,43 @@ func (s *TaskService) SendDirectChatMessage(ctx context.Context, session db.Chat
 // `multica agent update <id> --status idle` to unwedge. It now reconciles agent
 // status and broadcasts task:cancelled, matching CancelTask and RerunIssue.
 func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UUID) error {
-	cancelled, err := s.Queries.CancelAgentTasksByIssue(ctx, issueID)
+	candidates, err := s.Queries.ListCancellableAgentTasksByIssue(ctx, issueID)
 	if err != nil {
 		return err
 	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.ReconcileAgentStatus(ctx, t.AgentID)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	pending := false
+	for _, candidate := range candidates {
+		task, err := s.CancelTask(ctx, candidate.ID)
+		if err != nil {
+			return err
+		}
+		pending = pending || taskTerminationPending(*task)
 	}
-	s.notifyTasksFinished(cancelled)
+	if pending {
+		return ErrTaskTerminationPending
+	}
 	return nil
 }
 
-// CancelTasksForAgent cancels every active task belonging to an agent
-// (queued + dispatched + running), reconciles the agent's status, and
-// broadcasts task:cancelled events. Used by the agent-level "Cancel all
-// tasks" action — same shape as CancelTasksForIssue but scoped on agent_id.
+// CancelTasksForAgent requests cancellation for every active task belonging to
+// an agent. Returned rows preserve the distinction between immediately
+// terminated pre-start work and running work awaiting host confirmation.
 //
 // Returns the cancelled rows so callers can report counts / log them.
 func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	cancelled, err := s.Queries.CancelAgentTasksByAgent(ctx, agentID)
+	candidates, err := s.Queries.ListCancellableAgentTasksByAgent(ctx, agentID)
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	requested := make([]db.AgentTaskQueue, 0, len(candidates))
+	for _, candidate := range candidates {
+		task, err := s.CancelTask(ctx, candidate.ID)
+		if err != nil {
+			return requested, err
+		}
+		requested = append(requested, *task)
 	}
-	// Reconcile once after the loop — agent transitions from
-	// working→available based on remaining task counts, no need to call
-	// per row (the rows we just cancelled all belong to the same agent).
-	s.ReconcileAgentStatus(ctx, agentID)
-	s.notifyTasksFinished(cancelled)
-	return cancelled, nil
+	return requested, nil
 }
 
 // CancelTasksByTriggerComment cancels active tasks whose planned comment batch
@@ -1786,17 +2266,49 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 // retained for call-site stability. It must run before deletion clears the
 // trigger FK; the returned rows let the handler re-route every surviving input.
 func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	cancelled, err := s.Queries.CancelAgentTasksByTriggerComment(ctx, commentID)
+	candidates, err := s.Queries.ListCancellableAgentTasksByTriggerComment(ctx, commentID)
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.ReconcileAgentStatus(ctx, t.AgentID)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	requested := make([]db.AgentTaskQueue, 0, len(candidates))
+	pending := false
+	for _, candidate := range candidates {
+		task, err := s.CancelTask(ctx, candidate.ID)
+		if err != nil {
+			return requested, err
+		}
+		requested = append(requested, *task)
+		pending = pending || taskTerminationPending(*task)
 	}
-	s.notifyTasksFinished(cancelled)
-	return cancelled, nil
+	if pending {
+		return requested, ErrTaskTerminationPending
+	}
+	return requested, nil
+}
+
+// CancelTasksForChatSession requests cancellation for every active task in a
+// chat session. Callers must not delete the session or its system agent while
+// this returns ErrTaskTerminationPending because those cascades would erase the
+// task before the runtime can confirm termination.
+func (s *TaskService) CancelTasksForChatSession(ctx context.Context, sessionID pgtype.UUID) ([]db.AgentTaskQueue, error) {
+	candidates, err := s.Queries.ListCancellableAgentTasksByChatSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	requested := make([]db.AgentTaskQueue, 0, len(candidates))
+	pending := false
+	for _, candidate := range candidates {
+		task, err := s.CancelTask(ctx, candidate.ID)
+		if err != nil {
+			return requested, err
+		}
+		requested = append(requested, *task)
+		pending = pending || taskTerminationPending(*task)
+	}
+	if pending {
+		return requested, ErrTaskTerminationPending
+	}
+	return requested, nil
 }
 
 // BroadcastCancelledTasks reconciles each affected agent's status and emits
@@ -1845,8 +2357,9 @@ type CancelTaskOptions struct {
 	ClientSupportsDraftRestore bool
 }
 
-// CancelTask cancels a single task by ID. It broadcasts a task:cancelled event
-// so frontends can update immediately.
+// CancelTask requests cancellation for a single task. Pre-start work emits the
+// terminal task:cancelled event immediately; started work emits
+// task:cancellation_requested and remains running until host confirmation.
 func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	// Every caller of this wrapper cancels a non-chat task — issue/autopilot
 	// tasks through the issue-scoped endpoint, plus the daemon and sweeper paths
@@ -1864,28 +2377,31 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 // CancelTaskWithResult cancels a single task and returns any chat-specific
 // cleanup result needed by user-facing callers.
 func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UUID, opts CancelTaskOptions) (*CancelTaskResult, error) {
-	task, err := s.Queries.CancelAgentTask(ctx, taskID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		existing, err := s.Queries.GetAgentTask(ctx, taskID)
-		if err != nil {
-			return nil, fmt.Errorf("cancel task: %w", err)
-		}
-		return &CancelTaskResult{Task: existing}, nil
-	}
+	task, err := s.requestTaskCancellation(ctx, taskID)
 	if err != nil {
-		return nil, fmt.Errorf("cancel task: %w", err)
+		return nil, err
 	}
 
-	slog.Info("task cancelled", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
-	s.captureTaskCancelled(ctx, task)
-	cancelledChatMessage := s.finalizeCancelledChatMessage(ctx, task, opts)
-
-	// Reconcile agent status
-	s.ReconcileAgentStatus(ctx, task.AgentID)
-
-	// Broadcast cancellation as a task:failed event so frontends clear the live card
-	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
-	s.NotifyTaskFinished(task)
+	var cancelledChatMessage *CancelledChatMessageResult
+	if task.TerminationConfirmedAt.Valid {
+		slog.Info("task cancelled before host execution",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(task.IssueID))
+		s.captureTaskCancelled(ctx, task)
+		cancelledChatMessage = s.finalizeCancelledChatMessage(ctx, task, opts)
+		s.ReconcileAgentStatus(ctx, task.AgentID)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+		s.NotifyTaskFinished(task)
+	} else if task.CancellationRequestedAt.Valid {
+		slog.Info("task cancellation requested; host termination not yet confirmed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(task.IssueID))
+		// Preserve chat-cancellation compatibility without claiming the host
+		// stopped. Capable clients arm the durable marker and settle only after
+		// termination; legacy clients retain the synchronous restore path.
+		cancelledChatMessage = s.finalizeCancelledChatMessage(ctx, task, opts)
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancellationRequested, task)
+	}
 
 	return &CancelTaskResult{
 		Task:                 task,
@@ -1915,6 +2431,7 @@ func (s *TaskService) finalizeCancelledChatMessage(ctx context.Context, task db.
 			return fmt.Errorf("list cancelled chat task messages: %w", err)
 		}
 		restorable := len(messages) == 0
+		channelIngested := false
 		if restorable {
 			// Channel-ingested user messages are the durable record of what
 			// the platform sender wrote — the sender has no Multica composer
@@ -1926,18 +2443,18 @@ func (s *TaskService) finalizeCancelledChatMessage(ctx context.Context, task db.
 			// clone (which inherits chat_input_task_id) reaches the same
 			// verdict as its parent. A channel task settles as "Stopped."
 			// below instead of deleting its sealed input batch.
-			channelIngested, err := qtx.TaskHasChannelIngestedMessages(ctx, chatInputOwnerID(task))
+			channelIngested, err = qtx.TaskHasChannelIngestedMessages(ctx, chatInputOwnerID(task))
 			if err != nil {
 				return fmt.Errorf("check cancelled chat channel provenance: %w", err)
 			}
 			restorable = !channelIngested
 		}
-		if restorable && task.StartedAt.Valid && opts.ClientSupportsDraftRestore {
+		if !channelIngested && task.StartedAt.Valid && opts.ClientSupportsDraftRestore {
 			// A started task's daemon learns of the cancellation by polling
-			// and may still be flushing its transcript tail, so "empty" is
-			// not trustworthy yet. Defer the judgment until the daemon acks
-			// its flush (cancel-ack) or the sweeper grace period expires
-			// (#5219). "Non-empty" needs no deferral: late rows only append.
+			// and may still be flushing its transcript tail. Neither "empty"
+			// nor a partial non-empty transcript proves that the host stopped.
+			// Defer the final chat outcome until the daemon confirms runner.run
+			// returned (or the legacy sweeper settles the marker).
 			//
 			// Deferring is gated on the client: clients and server do not
 			// upgrade together, and a client that cannot read the durable
@@ -2166,6 +2683,7 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		outcome                                                              = "unknown"
 		getAgentMs, countRunningMs, claimAgentMs, updateStatusMs, dispatchMs int64
 		claimed                                                              *db.AgentTaskQueue
+		authorizationCancelled                                               *db.AgentTaskQueue
 	)
 	defer func() {
 		s.maybeLogClaimSlow(agentID, outcome, start, getAgentMs, countRunningMs, claimAgentMs, updateStatusMs, dispatchMs)
@@ -2194,10 +2712,7 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		}
 
 		t0 = time.Now()
-		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          agentID,
-			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
-		})
+		task, err := qtx.SelectClaimableAgentTask(ctx, agentID)
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -2206,7 +2721,35 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 				return nil
 			}
 			outcome = "error_claim"
-			return fmt.Errorf("claim task: %w", err)
+			return fmt.Errorf("select claimable task: %w", err)
+		}
+
+		decision, err := s.reauthorizeTask(ctx, qtx, task, "claim")
+		if err != nil {
+			outcome = "error_reauthorize"
+			return fmt.Errorf("claim-time authorization: %w", err)
+		}
+		if !decision.Allowed && !decision.ObserveOnly {
+			cancelled, cancelErr := qtx.CancelTaskForAuthorization(ctx, db.CancelTaskForAuthorizationParams{
+				TaskID: task.ID,
+				Reason: pgtype.Text{String: "authorization denied: " + decision.ReasonCode, Valid: true},
+			})
+			if cancelErr != nil {
+				outcome = "error_cancel_denied"
+				return fmt.Errorf("cancel authorization-denied task: %w", cancelErr)
+			}
+			authorizationCancelled = &cancelled
+			outcome = "authorization_denied"
+			return nil
+		}
+
+		task, err = qtx.DispatchAuthorizedAgentTask(ctx, db.DispatchAuthorizedAgentTaskParams{
+			TaskID:           task.ID,
+			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
+		})
+		if err != nil {
+			outcome = "error_dispatch_authorized"
+			return fmt.Errorf("dispatch authorized task: %w", err)
 		}
 
 		claimedTask := task
@@ -2220,6 +2763,10 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 		return nil, err
 	}
 	if claimed == nil {
+		if authorizationCancelled != nil {
+			s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, *authorizationCancelled)
+			s.ReconcileAgentStatus(ctx, authorizationCancelled.AgentID)
+		}
 		return nil, nil
 	}
 
@@ -2241,6 +2788,102 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 
 	outcome = "claimed"
 	return claimed, nil
+}
+
+func (s *TaskService) reclaimStaleTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	var reclaimed, cancelled *db.AgentTaskQueue
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		task, err := qtx.SelectStaleDispatchedTaskForRuntime(ctx, db.SelectStaleDispatchedTaskForRuntimeParams{
+			RuntimeID:         runtimeID,
+			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return fmt.Errorf("select stale dispatched task: %w", err)
+		}
+		decision, err := s.reauthorizeTask(ctx, qtx, task, "reclaim")
+		if err != nil {
+			return fmt.Errorf("reclaim-time authorization: %w", err)
+		}
+		if !decision.Allowed && !decision.ObserveOnly {
+			row, err := qtx.CancelTaskForAuthorization(ctx, db.CancelTaskForAuthorizationParams{
+				TaskID: task.ID,
+				Reason: pgtype.Text{String: "authorization denied: " + decision.ReasonCode, Valid: true},
+			})
+			if err != nil {
+				return fmt.Errorf("cancel authorization-denied reclaim: %w", err)
+			}
+			cancelled = &row
+			return nil
+		}
+		row, err := qtx.RefreshAuthorizedStaleDispatch(ctx, db.RefreshAuthorizedStaleDispatchParams{
+			TaskID:           task.ID,
+			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
+		})
+		if err != nil {
+			return fmt.Errorf("refresh authorized stale dispatch: %w", err)
+		}
+		reclaimed = &row
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if cancelled != nil {
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, *cancelled)
+		s.ReconcileAgentStatus(ctx, cancelled.AgentID)
+	}
+	return reclaimed, nil
+}
+
+func (s *TaskService) reclaimStaleTasksForRuntimes(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int) ([]db.AgentTaskQueue, error) {
+	var reclaimed, cancelled []db.AgentTaskQueue
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		tasks, err := qtx.SelectStaleDispatchedTasksForRuntimes(ctx, db.SelectStaleDispatchedTasksForRuntimesParams{
+			RuntimeIds:        runtimeIDs,
+			ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
+			MaxTasks:          int32(maxTasks),
+		})
+		if err != nil {
+			return fmt.Errorf("select stale dispatched tasks: %w", err)
+		}
+		for _, task := range tasks {
+			decision, err := s.reauthorizeTask(ctx, qtx, task, "reclaim")
+			if err != nil {
+				return fmt.Errorf("reclaim-time authorization: %w", err)
+			}
+			if !decision.Allowed && !decision.ObserveOnly {
+				row, err := qtx.CancelTaskForAuthorization(ctx, db.CancelTaskForAuthorizationParams{
+					TaskID: task.ID,
+					Reason: pgtype.Text{String: "authorization denied: " + decision.ReasonCode, Valid: true},
+				})
+				if err != nil {
+					return fmt.Errorf("cancel authorization-denied reclaim: %w", err)
+				}
+				cancelled = append(cancelled, row)
+				continue
+			}
+			row, err := qtx.RefreshAuthorizedStaleDispatch(ctx, db.RefreshAuthorizedStaleDispatchParams{
+				TaskID:           task.ID,
+				PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
+			})
+			if err != nil {
+				return fmt.Errorf("refresh authorized stale dispatch: %w", err)
+			}
+			reclaimed = append(reclaimed, row)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, task := range cancelled {
+		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+		s.ReconcileAgentStatus(ctx, task.AgentID)
+	}
+	return reclaimed, nil
 }
 
 // ClaimTaskForRuntime claims the next runnable task for a runtime while
@@ -2284,12 +2927,8 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 
 	// Check this before EmptyClaim: a lost claim response moves the task out of
 	// `queued`, so the empty-queued cache cannot represent recoverability.
-	stale, err := s.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
-		RuntimeID:         runtimeID,
-		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-	})
-	if err == nil {
+	stale, err := s.reclaimStaleTaskForRuntime(ctx, runtimeID)
+	if err == nil && stale != nil {
 		outcome = "reclaimed_dispatched"
 		claimedFlag = true
 		slog.Info("stale dispatched task reclaimed",
@@ -2297,9 +2936,9 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			"runtime_id", runtimeKey,
 			"agent_id", util.UUIDToString(stale.AgentID),
 		)
-		return &stale, nil
+		return stale, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil {
 		outcome = "error_reclaim_dispatched"
 		return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
 	}
@@ -2377,6 +3016,37 @@ func (s *TaskService) FinalizeTaskClaim(
 ) ([]pgtype.UUID, error) {
 	receipt := task.DeliveredCommentIds
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		decision, decisionErr := qtx.GetLatestAuthorizationDecisionByTask(ctx, task.ID)
+		if decisionErr != nil && !errors.Is(decisionErr, pgx.ErrNoRows) {
+			return fmt.Errorf("load claim authorization envelope: %w", decisionErr)
+		}
+		if decisionErr == nil && decision.CapabilityEnvelope {
+			remaining := decision.DelegationDepthRemaining.Int32
+			if decision.DelegationConsumed {
+				if remaining <= 0 {
+					return fmt.Errorf("claim authorization envelope has exhausted delegation depth")
+				}
+				remaining--
+			}
+			token.ProjectID = decision.ProjectID
+			token.IssueID = decision.IssueID
+			token.LineageID = decision.LineageID
+			token.AuthorizationSessionID = decision.SessionID
+			token.AllowedActions = append(make([]string, 0, len(decision.AllowedActions)), decision.AllowedActions...)
+			token.ExplicitDenies = append(make([]string, 0, len(decision.ExplicitDenies)), decision.ExplicitDenies...)
+			token.DelegationDepthRemaining = pgtype.Int4{Int32: remaining, Valid: true}
+			token.AllowedChildPrincipalIds = append(make([]pgtype.UUID, 0, len(decision.AllowedChildPrincipalIds)), decision.AllowedChildPrincipalIds...)
+			token.CapabilityEnvelope = true
+		}
+		if token.AllowedActions == nil {
+			token.AllowedActions = []string{}
+		}
+		if token.ExplicitDenies == nil {
+			token.ExplicitDenies = []string{}
+		}
+		if token.AllowedChildPrincipalIds == nil {
+			token.AllowedChildPrincipalIds = []pgtype.UUID{}
+		}
 		if _, err := qtx.CreateTaskToken(ctx, token); err != nil {
 			return fmt.Errorf("create task token: %w", err)
 		}
@@ -2493,12 +3163,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	}
 
 	// 2. Reclaim lost-response dispatched tasks across the set, up to maxTasks.
-	reclaimed, err := s.Queries.ReclaimStaleDispatchedTasksForRuntimes(ctx, db.ReclaimStaleDispatchedTasksForRuntimesParams{
-		RuntimeIds:        uniqueIDs,
-		ClaimRecoverySecs: claimResponseRecoveryWindow.Seconds(),
-		PrepareLeaseSecs:  prepareLeaseDuration.Seconds(),
-		MaxTasks:          int32(maxTasks),
-	})
+	reclaimed, err := s.reclaimStaleTasksForRuntimes(ctx, uniqueIDs, maxTasks)
 	if err != nil {
 		return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
 	}
@@ -3140,10 +3805,12 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 	// here — before the transaction — and only for retryable failures, so the
 	// common agent_error path skips this work entirely.
 	var (
-		wantRetry        bool
-		retryOverlay     runtimeMCPOverlayData
-		retryFireAt      pgtype.Timestamptz
-		retryMaxAttempts pgtype.Int4
+		wantRetry          bool
+		retryOverlay       runtimeMCPOverlayData
+		retryFireAt        pgtype.Timestamptz
+		retryMaxAttempts   pgtype.Int4
+		retryAdmission     admission.Request
+		retryAuthorization taskAuthorizationMetadata
 	)
 	if retryableReasons[failureReason] {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
@@ -3151,6 +3818,12 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 				"task_id", util.UUIDToString(taskID), "error", perr)
 		} else if retryEligible(failureReason, parent) {
 			wantRetry = true
+			retryAdmission = admission.Request{
+				Path:         admission.PathRetry,
+				IssueID:      util.UUIDToString(parent.IssueID),
+				AgentID:      util.UUIDToString(parent.AgentID),
+				ParentTaskID: util.UUIDToString(parent.ID),
+			}
 			// Persist the reason-aware effective budget into the child so the
 			// retry chain self-describes (e.g. provider_network → max_attempts=3),
 			// rather than leaking a contradictory attempt=N/max_attempts=2 row.
@@ -3168,8 +3841,30 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 					"task_id", util.UUIDToString(taskID),
 					"agent_id", util.UUIDToString(parent.AgentID), "error", aerr)
 			} else {
+				retryAdmission.WorkspaceID = util.UUIDToString(agent.WorkspaceID)
+				if parent.IssueID.Valid {
+					issue, ierr := s.Queries.GetIssue(ctx, parent.IssueID)
+					if ierr != nil {
+						slog.Warn("fail task auto-retry: load issue authorization scope failed", "task_id", util.UUIDToString(taskID), "error", ierr)
+						wantRetry = false
+					} else {
+						retryAdmission.ProjectID = util.UUIDToString(issue.ProjectID)
+					}
+				}
 				retryOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
 			}
+		}
+	}
+	if wantRetry {
+		decision, err := s.AdmitTask(ctx, retryAdmission)
+		if err != nil {
+			slog.Warn("fail task auto-retry denied by admission",
+				"task_id", util.UUIDToString(taskID), "error", err)
+			wantRetry = false
+		} else if retryAuthorization, err = metadataFromAdmission(decision); err != nil {
+			slog.Warn("fail task auto-retry admission metadata invalid",
+				"task_id", util.UUIDToString(taskID), "error", err)
+			wantRetry = false
 		}
 	}
 
@@ -3258,11 +3953,15 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		// and the bumped chat-retry priority; broadcast/notify happen after commit.
 		if wantRetry {
 			child, cerr := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-				ID:                   taskID,
-				FireAt:               retryFireAt,
-				MaxAttempts:          retryMaxAttempts,
-				RuntimeMcpOverlay:    retryOverlay.Overlay,
-				RuntimeConnectedApps: retryOverlay.ConnectedApps,
+				ID:                         taskID,
+				FireAt:                     retryFireAt,
+				MaxAttempts:                retryMaxAttempts,
+				RuntimeMcpOverlay:          retryOverlay.Overlay,
+				RuntimeConnectedApps:       retryOverlay.ConnectedApps,
+				AdmissionDecisionID:        retryAuthorization.decisionID,
+				AuthorizationPolicyVersion: retryAuthorization.policyVersion,
+				LineageID:                  retryAuthorization.lineageID,
+				BudgetReservationID:        retryAuthorization.budgetReservationID,
 			})
 			if cerr != nil {
 				return fmt.Errorf("create retry task: %w", cerr)
@@ -3271,6 +3970,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		}
 		return nil
 	}); err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, retryAuthorization, "task_transaction_rolled_back")
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				slog.Info("fail task: already finalized",
@@ -3549,6 +4249,14 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	} else {
 		runtimeMCPOverlay = s.buildRuntimeMCPOverlay(ctx, parent.OriginatorUserID, agent)
 	}
+	var projectID pgtype.UUID
+	if parent.IssueID.Valid {
+		issue, err := s.Queries.GetIssue(ctx, parent.IssueID)
+		if err != nil {
+			return nil, fmt.Errorf("load retry authorization scope: %w", err)
+		}
+		projectID = issue.ProjectID
+	}
 	// Mirror FailTask's in-tx backoff + effective-budget persistence: defer the
 	// final provider_network attempt ~5s via fire_at (zero delay leaves fire_at
 	// NULL for an immediate child), and write the reason-aware ceiling into the
@@ -3557,14 +4265,36 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	if delay := retryDelayForAttempt(reason, parent.Attempt); delay > 0 {
 		retryFireAt = pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
 	}
-	child, err := s.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{
-		ID:                   parent.ID,
-		FireAt:               retryFireAt,
-		MaxAttempts:          pgtype.Int4{Int32: retryAttemptCeiling(reason, parent.MaxAttempts), Valid: true},
-		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
-		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
+	decision, err := s.AdmitTask(ctx, admission.Request{
+		Path:         admission.PathRetry,
+		WorkspaceID:  util.UUIDToString(agent.WorkspaceID),
+		ProjectID:    util.UUIDToString(projectID),
+		IssueID:      util.UUIDToString(parent.IssueID),
+		AgentID:      util.UUIDToString(parent.AgentID),
+		ParentTaskID: util.UUIDToString(parent.ID),
 	})
 	if err != nil {
+		slog.Warn("task auto-retry denied by admission",
+			"parent_task_id", util.UUIDToString(parent.ID), "error", err)
+		return nil, err
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return nil, fmt.Errorf("task auto-retry admission metadata: %w", err)
+	}
+	child, err := s.Queries.CreateRetryTask(ctx, db.CreateRetryTaskParams{
+		ID:                         parent.ID,
+		FireAt:                     retryFireAt,
+		MaxAttempts:                pgtype.Int4{Int32: retryAttemptCeiling(reason, parent.MaxAttempts), Valid: true},
+		RuntimeMcpOverlay:          runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps:       runtimeMCPOverlay.ConnectedApps,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
+	})
+	if err != nil {
+		s.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		slog.Warn("task auto-retry failed",
 			"parent_task_id", util.UUIDToString(parent.ID),
 			"reason", reason,
@@ -3719,7 +4449,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	}
 
 	// Cancel only the target agent's active/queued tasks on this issue.
-	cancelled, err := s.Queries.CancelAgentTasksByIssueAndAgent(ctx, db.CancelAgentTasksByIssueAndAgentParams{
+	candidates, err := s.Queries.ListCancellableAgentTasksByIssueAndAgent(ctx, db.ListCancellableAgentTasksByIssueAndAgentParams{
 		IssueID: issueID,
 		AgentID: agentID,
 	})
@@ -3730,10 +4460,18 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 			"error", err,
 		)
 	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.ReconcileAgentStatus(ctx, t.AgentID)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	cancelled := make([]db.AgentTaskQueue, 0, len(candidates))
+	pending := false
+	for _, candidate := range candidates {
+		task, cancelErr := s.CancelTask(ctx, candidate.ID)
+		if cancelErr != nil {
+			return nil, fmt.Errorf("rerun: request prior task cancellation: %w", cancelErr)
+		}
+		cancelled = append(cancelled, *task)
+		pending = pending || taskTerminationPending(*task)
+	}
+	if pending {
+		return nil, ErrTaskTerminationPending
 	}
 
 	// A manual rerun is a NEW direct_human trigger attributed to the rerunning

@@ -63,7 +63,9 @@ func (f candidateFailDBTX) QueryRow(ctx context.Context, sql string, args ...int
 func TestClaimTasksForRuntimes_PartialSuccessOnSecondAgentClaimFailure(t *testing.T) {
 	ctx := context.Background()
 	pool := newTaskClaimRacePool(t)
-	tx := &failNthBeginTxStarter{inner: pool, failOn: 2} // 1st agent claims, 2nd errors
+	// Reclaim authorization now owns the first transaction even when no stale
+	// row exists; the first and second agent claims are transactions 2 and 3.
+	tx := &failNthBeginTxStarter{inner: pool, failOn: 3}
 	svc := NewTaskService(db.New(pool), tx, nil, events.New())
 
 	rt1, rt2 := batchClaimFixture(t, ctx, pool)
@@ -122,6 +124,7 @@ func TestClaimTasksForRuntimes_PartialSuccessOnCandidateQueryFailureAfterReclaim
 		RETURNING id`, agentID, rt1, issueID).Scan(&staleTaskID); err != nil {
 		t.Fatalf("create stale dispatched task: %v", err)
 	}
+	authorizeTaskForClaim(t, pool, staleTaskID)
 	t.Cleanup(func() {
 		c := context.Background()
 		pool.Exec(c, `DELETE FROM agent_task_queue WHERE id = $1`, staleTaskID)

@@ -3567,7 +3567,11 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": task.Status})
+	status := task.Status
+	if task.CancellationRequestedAt.Valid && !task.TerminationConfirmedAt.Valid {
+		status = "cancellation_requested"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
 }
 
 // FailTask marks a running task as failed.
@@ -3716,18 +3720,44 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// AckTaskCancelled receives the daemon's acknowledgement that it observed a
-// task cancellation and finished flushing the transcript. Settles the chat
-// finalization that CancelTaskWithResult deferred for a started-but-empty
-// transcript (#5219); idempotent when nothing was deferred.
+// AckTaskCancellationObserved records that the daemon saw the server's stop
+// request. It is not evidence that runner.run returned or that the host process
+// is gone, so it deliberately leaves the task non-terminal.
+func (h *Handler) AckTaskCancellationObserved(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
+	if !ok {
+		return
+	}
+	acknowledged, err := h.TaskService.AcknowledgeTaskCancellation(r.Context(), task.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to acknowledge task cancellation")
+		return
+	}
+	writeJSON(w, http.StatusOK, taskToResponse(*acknowledged, ""))
+}
+
+// AckTaskCancelled is the daemon's positive confirmation that runner.run has
+// returned and transcript flushing is complete. Only this callback records
+// actual host termination, changes the legacy task status to cancelled, and
+// settles any deferred chat finalization. It is idempotent.
 func (h *Handler) AckTaskCancelled(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 	task, ok := h.requireDaemonTaskAccess(w, r, taskID)
 	if !ok {
 		return
 	}
+	terminated, err := h.TaskService.ConfirmTaskTermination(r.Context(), task.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to confirm task termination")
+		return
+	}
+	// Preserve the legacy marker settlement for pre-V1 cancelled rows that do
+	// not have a revocation record. ConfirmTaskTermination already invokes the
+	// normal finalizer; this second call is a harmless no-op because the marker
+	// claim is atomic.
 	h.TaskService.FinalizeDeferredCancelledChat(r.Context(), task.ID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, taskToResponse(*terminated, ""))
 }
 
 func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.TaskMessagePayload {
@@ -3844,7 +3874,18 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("task cancelled by user", "task_id", taskID, "issue_id", uuidToString(task.IssueID))
+	if task.CancellationRequestedAt.Valid && !task.TerminationConfirmedAt.Valid {
+		slog.Info("task cancellation requested by user; host termination unconfirmed",
+			"task_id", taskID,
+			"issue_id", uuidToString(task.IssueID),
+			"server_access_denied", true,
+			"host_termination_confirmed", false)
+	} else {
+		slog.Info("task cancellation completed before host execution",
+			"task_id", taskID,
+			"issue_id", uuidToString(task.IssueID),
+			"host_execution_started", task.StartedAt.Valid)
+	}
 	resp := taskToResponse(*task, uuidToString(issue.WorkspaceID))
 	// Keep this issue-scoped surface consistent with the list endpoints so a
 	// cancelled row keeps its resolved "on behalf of" name in the UI.

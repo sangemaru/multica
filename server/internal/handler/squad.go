@@ -937,9 +937,14 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	taskID := r.Header.Get("X-Task-ID")
-	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task id")
-	if !ok {
+	requestIdentity, ok := requestAgentTaskIdentity(r)
+	if !ok || requestIdentity.AgentID != actorID {
+		writeError(w, http.StatusForbidden, "missing authenticated task identity")
+		return
+	}
+	taskUUID, err := util.ParseUUID(requestIdentity.TaskID)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "invalid authenticated task identity")
 		return
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)

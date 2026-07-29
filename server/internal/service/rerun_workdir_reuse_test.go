@@ -58,6 +58,7 @@ func TestRerunIssuePinsForceFreshSessionForRollbackSafety(t *testing.T) {
 			`, agentID, runtimeID, issueID, tc.status, tc.failureReason).Scan(&sourceID); err != nil {
 				t.Fatalf("insert source task: %v", err)
 			}
+			authorizeTaskForClaim(t, pool, sourceID)
 			t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, sourceID) })
 
 			task, err := svc.RerunIssue(ctx, util.MustParseUUID(issueID), sourceID, pgtype.UUID{}, util.MustParseUUID(creatorID), nil)

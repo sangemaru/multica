@@ -32,29 +32,34 @@ func authRequestWithAgent(t *testing.T, method, path string, body any, agentID s
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	req.Header.Set("X-Workspace-ID", testWorkspaceID)
 	req.Header.Set("X-Agent-ID", agentID)
-	req.Header.Set("X-Task-ID", ensureAgentTask(t, agentID))
+	taskID := ensureAgentTask(t, agentID)
+	req.Header.Set("X-Task-ID", taskID)
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now()
+		WHERE id = $1 AND status = 'running'
+	`, taskID); err != nil {
+		t.Fatalf("complete agent identity task: %v", err)
+	}
 	return r
 }
 
-// ensureAgentTask returns a queued task UUID belonging to the given agent,
+// ensureAgentTask returns a running task UUID belonging to the given agent,
 // inserting one if none exists. Used by authRequestWithAgent so callers
 // can keep treating "set X-Agent-ID" as the single knob for posing as an
 // agent — resolveActor's pair-required policy is satisfied transparently.
+// The identity task is deliberately running rather than queued: it represents
+// the execution making the request and must not be mistaken for a pending
+// trigger created by the behavior under test.
 func ensureAgentTask(t *testing.T, agentID string) string {
 	t.Helper()
 	ctx := context.Background()
 	var taskID string
-	if err := testPool.QueryRow(ctx,
-		`SELECT id::text FROM agent_task_queue WHERE agent_id = $1 LIMIT 1`,
-		agentID,
-	).Scan(&taskID); err == nil && taskID != "" {
-		return taskID
-	}
 	var runtimeID string
 	if err := testPool.QueryRow(ctx,
 		`SELECT runtime_id::text FROM agent WHERE id = $1`,
@@ -63,8 +68,8 @@ func ensureAgentTask(t *testing.T, agentID string) string {
 		t.Fatalf("ensureAgentTask: load runtime_id for agent %s: %v", agentID, err)
 	}
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority)
-		VALUES ($1, $2, 'queued', 0)
+		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, started_at)
+		VALUES ($1, $2, 'running', 0, now())
 		RETURNING id::text
 	`, agentID, runtimeID).Scan(&taskID); err != nil {
 		t.Fatalf("ensureAgentTask: insert task for agent %s: %v", agentID, err)
@@ -403,6 +408,9 @@ func TestCommentTriggerAtAllSuppression(t *testing.T) {
 	t.Run("@all in agent thread suppresses on_comment", func(t *testing.T) {
 		clearTasks(t, issueID)
 		threadID := postCommentAsAgent(t, issueID, "Here is my analysis.", agentID, nil)
+		// Isolate the @all reply from any task produced while creating the
+		// agent-authored thread root; only the reply is under assertion here.
+		clearTasks(t, issueID)
 		postComment(t, issueID, "[@All](mention://all/all) FYI for the team", strPtr(threadID))
 		if n := countPendingTasks(t, issueID); n != 0 {
 			t.Errorf("expected 0 pending tasks (@all in agent thread), got %d", n)

@@ -100,6 +100,9 @@ func newAutopilotDelegationFixture(t *testing.T, targetAgentID, autopilotCreator
 	`, leaderID, runtimeID, issueID).Scan(&leaderTaskID); err != nil {
 		t.Fatalf("create leader task: %v", err)
 	}
+	if err := authorizeHandlerClaimFixtures(ctx, testWorkspaceID); err != nil {
+		t.Fatalf("authorize leader task fixture: %v", err)
+	}
 
 	// The delegation comment: authored by the leader agent, mentioning the target,
 	// with source_task_id pointing back at the leader's running task (the lineage
@@ -155,6 +158,9 @@ func seedTaskOnIssue(t *testing.T, agentID, issueID, runtimeID string) string {
 		VALUES ($1, $2, $3, 'running', 0) RETURNING id
 	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
 		t.Fatalf("seed task on issue: %v", err)
+	}
+	if err := authorizeHandlerClaimFixtures(context.Background(), testWorkspaceID); err != nil {
+		t.Fatalf("authorize task-on-issue fixture: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
 	return taskID
@@ -291,14 +297,12 @@ func TestCreateComment_AutopilotLeaderMentionEnqueuesPrivateWorker(t *testing.T)
 	fx := newAutopilotDelegationFixture(t, workerID, ownerID, "autopilot")
 	issueID := uuidToString(fx.Issue.ID)
 
-	// The leader posts the mention comment in its agent identity. resolveActor
-	// trusts the header pair because fx.LeaderTaskID belongs to the leader agent.
+	// The leader posts the mention comment in its authenticated task identity.
 	w := httptest.NewRecorder()
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "[@Worker](mention://agent/" + workerID + ") please handle",
 	})
-	r.Header.Set("X-Agent-ID", fx.LeaderAgentID)
-	r.Header.Set("X-Task-ID", fx.LeaderTaskID)
+	r = withAgentTaskIdentity(r, fx.LeaderAgentID, fx.LeaderTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
@@ -472,8 +476,7 @@ func TestUpdateComment_AutopilotAuthorityReStampedToEditingTask(t *testing.T) {
 		r := newRequest(http.MethodPut, "/api/comments/"+commentID, map[string]any{
 			"content": "[@Worker](mention://agent/" + workerID + ") please take this",
 		})
-		r.Header.Set("X-Agent-ID", fx.LeaderAgentID)
-		r.Header.Set("X-Task-ID", editTaskID)
+		r = withAgentTaskIdentity(r, fx.LeaderAgentID, editTaskID)
 		r = withURLParam(r, "commentId", commentID)
 		testHandler.UpdateComment(w, r)
 		if w.Code != http.StatusOK {
@@ -585,8 +588,7 @@ func TestCreateComment_AutopilotWorkerResultWakesSquadLeader(t *testing.T) {
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "done — pushed the change",
 	})
-	r.Header.Set("X-Agent-ID", workerID)
-	r.Header.Set("X-Task-ID", workerTaskID)
+	r = withAgentTaskIdentity(r, workerID, workerTaskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {

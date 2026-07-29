@@ -114,10 +114,15 @@ export function AgentRowActions({
 
   const handleCancelTasks = async () => {
     try {
-      const { cancelled } = await api.cancelAgentTasks(agent.id);
+      const { cancelled, cancellation_requested: cancellationRequested } =
+        await api.cancelAgentTasks(agent.id);
       invalidateAgents();
       toast.success(
-        cancelled === 0
+        cancellationRequested > 0
+          ? t(($) => $.row_actions.cancellation_requested_toast, {
+              count: cancellationRequested,
+            })
+          : cancelled === 0
           ? t(($) => $.row_actions.no_tasks_to_cancel_toast)
           : t(($) => $.row_actions.cancelled_tasks_toast, { count: cancelled }),
       );

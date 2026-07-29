@@ -31,8 +31,9 @@ type BusinessMetrics struct {
 	llmUnpricedTokens *prometheus.CounterVec
 	llmRequests       *prometheus.CounterVec
 
-	taskQueuedExpired *prometheus.CounterVec
-	taskLeaseExpired  *prometheus.CounterVec
+	taskQueuedExpired         *prometheus.CounterVec
+	taskLeaseExpired          *prometheus.CounterVec
+	authorizationDryRunDenied *prometheus.CounterVec
 
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
@@ -145,10 +146,17 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Name:      "lease_expired_total",
 			Help:      "Total dispatched or running task leases expired by the scheduler.",
 		}, metricLabels("multica_task_lease_expired_total")),
+		authorizationDryRunDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "authorization",
+			Name:      "dry_run_denied_total",
+			Help:      "Observe-only authorization denials by bounded dispatch path, credential class, and reason.",
+		}, metricLabels("multica_authorization_dry_run_denied_total")),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
 	m.prewarmFailureReasons()
+	m.authorizationDryRunDenied.WithLabelValues("unknown", "unknown", "unknown")
 	return m
 }
 
@@ -170,7 +178,15 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.llmRequests,
 		m.taskQueuedExpired,
 		m.taskLeaseExpired,
+		m.authorizationDryRunDenied,
 	}, m.events.collectors()...)
+}
+
+func (m *BusinessMetrics) RecordAuthorizationDryRunDenied(path, credentialClass, reasonCode string) {
+	if m == nil {
+		return
+	}
+	m.authorizationDryRunDenied.WithLabelValues(path, credentialClass, reasonCode).Inc()
 }
 
 func (m *BusinessMetrics) RecordTaskEnqueued(source, runtimeMode string) {

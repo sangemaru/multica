@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -157,8 +158,14 @@ func TestResolveWorkspaceIDFromRequest(t *testing.T) {
 			// also a member of.
 			name: "task_token actor: client-supplied slug/id cannot override token-bound workspace",
 			setup: func(r *http.Request) {
-				r.Header.Set("X-Actor-Source", "task_token")
-				r.Header.Set("X-Workspace-ID", uuidA)
+				ctx := requestidentity.WithRequest(r.Context(), requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalAgent,
+					CredentialClass: requestidentity.CredentialAgentTaskToken,
+					AgentID:         "agent-id",
+					TaskID:          "task-id",
+					WorkspaceID:     uuidA,
+				})
+				*r = *r.WithContext(ctx)
 				// All of these should be ignored under task_token.
 				r.Header.Set("X-Workspace-Slug", testResolverSlug)
 				q := r.URL.Query()

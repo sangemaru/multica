@@ -2240,9 +2240,10 @@ func runIssueRerun(cmd *cobra.Command, args []string) error {
 
 // runIssueCancelTask cancels a single task by ID. It accepts the short ID
 // prefix shown by `issue runs` (resolved through resolveTaskRunID), and uses
-// /api/tasks/{taskId}/cancel which both updates the DB row to status=cancelled
-// and triggers the daemon-side interrupt path (#2107) so an in-flight agent
-// stops emitting tool calls promptly instead of running until its own timeout.
+// /api/tasks/{taskId}/cancel. For work that never started, cancellation is
+// immediately terminal. For a running task, the response distinguishes server
+// access denial, cancellation request, runtime acknowledgement, and confirmed
+// host termination instead of claiming the process stopped synchronously.
 func runIssueCancelTask(cmd *cobra.Command, args []string) error {
 	client, err := newAPIClient(cmd)
 	if err != nil {
@@ -2275,9 +2276,23 @@ func runIssueCancelTask(cmd *cobra.Command, args []string) error {
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, result)
 	}
+	if revocation, ok := result["revocation"].(map[string]any); ok {
+		state := strVal(revocation, "state")
+		switch state {
+		case "cancellation_requested":
+			fmt.Fprintf(os.Stdout, "Task %s: server access denied; cancellation requested; host termination not yet confirmed\n", taskRef.ID)
+			return nil
+		case "runtime_acknowledged":
+			fmt.Fprintf(os.Stdout, "Task %s: runtime acknowledged cancellation; host termination not yet confirmed\n", taskRef.ID)
+			return nil
+		case "terminated":
+			fmt.Fprintf(os.Stdout, "Task %s: host termination confirmed\n", taskRef.ID)
+			return nil
+		}
+	}
 	status := strVal(result, "status")
 	if status == "" {
-		status = "cancelled"
+		status = "unknown"
 	}
 	fmt.Fprintf(os.Stdout, "Task %s -> status=%s\n", taskRef.ID, status)
 	return nil

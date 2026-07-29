@@ -52,6 +52,7 @@ type Agent struct {
 	SystemKey             pgtype.Text `json:"system_key"`
 	DisabledRuntimeSkills []byte      `json:"disabled_runtime_skills"`
 	ServiceTier           pgtype.Text `json:"service_tier"`
+	AuthorizationClass    string      `json:"authorization_class"`
 }
 
 // Allow-list of who may invoke a public_to agent (MUL-3963). One row per (agent, target_type, target); targets stack and canInvokeAgent OR-matches. workspace rows store the agent workspace_id in target_id; member rows store the user id; team rows are reserved and inert in V1. Rows only matter when agent.permission_mode = public_to. No DB foreign keys: agent_id / created_by / member target_id relationships are maintained in the application layer (see migration comment).
@@ -149,9 +150,16 @@ type AgentTaskQueue struct {
 	// The row id referenced by trigger_evidence_kind (a comment id, autopilot_run id, rule_version id, source task id, ...). No FK; resolvable per-kind in the app layer (MUL-4302 §2).
 	TriggerEvidenceRefID pgtype.UUID `json:"trigger_evidence_ref_id"`
 	// The one human accountable for this run, for audit / visibility / cost only — NEVER consulted for authorization (that is originator_user_id). Invariant: when originator_user_id IS NOT NULL, this equals it; the two diverge only when originator_user_id IS NULL (autopilot rule_owner / degraded owner_fallback name an accountable human while authorization carries none). No FK, no cascade (MUL-4302 §1/§7). NULL means no accountable human was resolved: a pre-migration row, OR a NEW row whose audit source is not-yet-resolved / unattributed (e.g. run_only autopilot until rule_owner lands) — NOT pre-migration only.
-	AccountableUserID     pgtype.UUID `json:"accountable_user_id"`
-	SessionRolloutMissing bool        `json:"session_rollout_missing"`
-	RetiredSessionID      pgtype.Text `json:"retired_session_id"`
+	AccountableUserID                 pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing             bool               `json:"session_rollout_missing"`
+	RetiredSessionID                  pgtype.Text        `json:"retired_session_id"`
+	AdmissionDecisionID               pgtype.UUID        `json:"admission_decision_id"`
+	AuthorizationPolicyVersion        pgtype.Text        `json:"authorization_policy_version"`
+	LineageID                         pgtype.UUID        `json:"lineage_id"`
+	BudgetReservationID               pgtype.UUID        `json:"budget_reservation_id"`
+	CancellationRequestedAt           pgtype.Timestamptz `json:"cancellation_requested_at"`
+	CancellationRuntimeAcknowledgedAt pgtype.Timestamptz `json:"cancellation_runtime_acknowledged_at"`
+	TerminationConfirmedAt            pgtype.Timestamptz `json:"termination_confirmed_at"`
 }
 
 type AgentToLabel struct {
@@ -175,6 +183,212 @@ type Attachment struct {
 	ChatSessionID pgtype.UUID        `json:"chat_session_id"`
 	ChatMessageID pgtype.UUID        `json:"chat_message_id"`
 	TaskID        pgtype.UUID        `json:"task_id"`
+}
+
+type AuthorizationAgentClassAssignment struct {
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	AgentID            pgtype.UUID        `json:"agent_id"`
+	AuthorizationClass string             `json:"authorization_class"`
+	AssignedByUserID   pgtype.UUID        `json:"assigned_by_user_id"`
+	Reason             string             `json:"reason"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationApprovalCase struct {
+	ID                       pgtype.UUID        `json:"id"`
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	RequesterPrincipalType   string             `json:"requester_principal_type"`
+	RequesterPrincipalID     string             `json:"requester_principal_id"`
+	RequesterCredentialClass string             `json:"requester_credential_class"`
+	RequesterSessionID       pgtype.UUID        `json:"requester_session_id"`
+	OriginatorUserID         pgtype.UUID        `json:"originator_user_id"`
+	DesignatedApproverUserID pgtype.UUID        `json:"designated_approver_user_id"`
+	Action                   string             `json:"action"`
+	ResourceType             string             `json:"resource_type"`
+	ResourceID               pgtype.UUID        `json:"resource_id"`
+	ReasonCode               string             `json:"reason_code"`
+	Status                   string             `json:"status"`
+	Decision                 pgtype.Text        `json:"decision"`
+	DeliveredAt              pgtype.Timestamptz `json:"delivered_at"`
+	AcknowledgedAt           pgtype.Timestamptz `json:"acknowledged_at"`
+	DecidedAt                pgtype.Timestamptz `json:"decided_at"`
+	AppliedAt                pgtype.Timestamptz `json:"applied_at"`
+	ResolvedAt               pgtype.Timestamptz `json:"resolved_at"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AuthorizationApprovalCaseEvent struct {
+	ID                   int64              `json:"id"`
+	CaseID               pgtype.UUID        `json:"case_id"`
+	IdempotencyKey       string             `json:"idempotency_key"`
+	EventType            string             `json:"event_type"`
+	ActorPrincipalType   string             `json:"actor_principal_type"`
+	ActorPrincipalID     string             `json:"actor_principal_id"`
+	ActorCredentialClass string             `json:"actor_credential_class"`
+	ActorSessionID       pgtype.UUID        `json:"actor_session_id"`
+	ReasonCode           string             `json:"reason_code"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationBudgetEvent struct {
+	ID                  int64              `json:"id"`
+	LineageID           pgtype.UUID        `json:"lineage_id"`
+	ReservationID       pgtype.UUID        `json:"reservation_id"`
+	AdmissionDecisionID pgtype.UUID        `json:"admission_decision_id"`
+	TaskID              pgtype.UUID        `json:"task_id"`
+	EventType           string             `json:"event_type"`
+	Generation          int64              `json:"generation"`
+	ReasonCode          string             `json:"reason_code"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationBudgetReservation struct {
+	ID                  pgtype.UUID        `json:"id"`
+	LineageID           pgtype.UUID        `json:"lineage_id"`
+	AdmissionDecisionID pgtype.UUID        `json:"admission_decision_id"`
+	Generation          int64              `json:"generation"`
+	Status              string             `json:"status"`
+	TaskID              pgtype.UUID        `json:"task_id"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt          pgtype.Timestamptz `json:"consumed_at"`
+	ReleasedAt          pgtype.Timestamptz `json:"released_at"`
+	ReleaseReason       pgtype.Text        `json:"release_reason"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AuthorizationDecision struct {
+	ID                       pgtype.UUID        `json:"id"`
+	Path                     string             `json:"path"`
+	Action                   string             `json:"action"`
+	PrincipalType            string             `json:"principal_type"`
+	PrincipalID              pgtype.UUID        `json:"principal_id"`
+	CredentialClass          string             `json:"credential_class"`
+	SessionID                pgtype.UUID        `json:"session_id"`
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	ProjectID                pgtype.UUID        `json:"project_id"`
+	IssueID                  pgtype.UUID        `json:"issue_id"`
+	AgentID                  pgtype.UUID        `json:"agent_id"`
+	ParentTaskID             pgtype.UUID        `json:"parent_task_id"`
+	Allowed                  bool               `json:"allowed"`
+	ReasonCode               string             `json:"reason_code"`
+	PolicyVersion            string             `json:"policy_version"`
+	ObserveOnly              bool               `json:"observe_only"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	LineageID                pgtype.UUID        `json:"lineage_id"`
+	EvaluationPhase          string             `json:"evaluation_phase"`
+	TaskID                   pgtype.UUID        `json:"task_id"`
+	AllowedActions           []string           `json:"allowed_actions"`
+	ExplicitDenies           []string           `json:"explicit_denies"`
+	DelegationDepthRemaining pgtype.Int4        `json:"delegation_depth_remaining"`
+	AllowedChildPrincipalIds []pgtype.UUID      `json:"allowed_child_principal_ids"`
+	CapabilityEnvelope       bool               `json:"capability_envelope"`
+	DelegationConsumed       bool               `json:"delegation_consumed"`
+}
+
+type AuthorizationLineageBudget struct {
+	LineageID          pgtype.UUID        `json:"lineage_id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	ExecutionLimit     int32              `json:"execution_limit"`
+	ReservedExecutions int32              `json:"reserved_executions"`
+	ConsumedExecutions int32              `json:"consumed_executions"`
+	Generation         int64              `json:"generation"`
+	BreakerState       string             `json:"breaker_state"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AuthorizationPolicyAssertion struct {
+	ID              pgtype.UUID        `json:"id"`
+	PolicyVersionID pgtype.UUID        `json:"policy_version_id"`
+	Effect          string             `json:"effect"`
+	Action          string             `json:"action"`
+	SubjectType     string             `json:"subject_type"`
+	SubjectValue    pgtype.Text        `json:"subject_value"`
+	ReasonCode      string             `json:"reason_code"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationPolicyCurrent struct {
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ScopeType       string             `json:"scope_type"`
+	ScopeKey        string             `json:"scope_key"`
+	PolicyVersionID pgtype.UUID        `json:"policy_version_id"`
+	Version         int64              `json:"version"`
+	EnforcementMode string             `json:"enforcement_mode"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AuthorizationPolicyVersion struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ScopeType       string             `json:"scope_type"`
+	ScopeKey        string             `json:"scope_key"`
+	Version         int64              `json:"version"`
+	EnforcementMode string             `json:"enforcement_mode"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	Reason          string             `json:"reason"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationSession struct {
+	ID                       pgtype.UUID        `json:"id"`
+	TokenHash                string             `json:"token_hash"`
+	TokenPrefix              string             `json:"token_prefix"`
+	CredentialClass          string             `json:"credential_class"`
+	UserID                   pgtype.UUID        `json:"user_id"`
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	ProjectID                pgtype.UUID        `json:"project_id"`
+	IssueID                  pgtype.UUID        `json:"issue_id"`
+	HarnessType              pgtype.Text        `json:"harness_type"`
+	AuthenticationAssurance  string             `json:"authentication_assurance"`
+	PresenceVerifiedAt       pgtype.Timestamptz `json:"presence_verified_at"`
+	AllowedActions           []string           `json:"allowed_actions"`
+	ExplicitDenies           []string           `json:"explicit_denies"`
+	MaxDelegationDepth       int32              `json:"max_delegation_depth"`
+	AllowedChildPrincipalIds []pgtype.UUID      `json:"allowed_child_principal_ids"`
+	LineageID                pgtype.UUID        `json:"lineage_id"`
+	PolicyVersion            int64              `json:"policy_version"`
+	BoundRuntimeID           pgtype.UUID        `json:"bound_runtime_id"`
+	ExpiresAt                pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt               pgtype.Timestamptz `json:"last_used_at"`
+	RotatedAt                pgtype.Timestamptz `json:"rotated_at"`
+	RevokedAt                pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+}
+
+type AuthorizationTaskRevocation struct {
+	ID                         pgtype.UUID        `json:"id"`
+	TaskID                     pgtype.UUID        `json:"task_id"`
+	WorkspaceID                pgtype.UUID        `json:"workspace_id"`
+	RequestedByPrincipalType   string             `json:"requested_by_principal_type"`
+	RequestedByPrincipalID     string             `json:"requested_by_principal_id"`
+	RequestedByCredentialClass string             `json:"requested_by_credential_class"`
+	RequestedBySessionID       pgtype.UUID        `json:"requested_by_session_id"`
+	ReasonCode                 string             `json:"reason_code"`
+	Status                     string             `json:"status"`
+	ServerDeniedAt             pgtype.Timestamptz `json:"server_denied_at"`
+	CancellationRequestedAt    pgtype.Timestamptz `json:"cancellation_requested_at"`
+	RuntimeAcknowledgedAt      pgtype.Timestamptz `json:"runtime_acknowledged_at"`
+	TerminatedAt               pgtype.Timestamptz `json:"terminated_at"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AuthorizationTaskRevocationEvent struct {
+	ID                   int64              `json:"id"`
+	RevocationID         pgtype.UUID        `json:"revocation_id"`
+	TaskID               pgtype.UUID        `json:"task_id"`
+	EventType            string             `json:"event_type"`
+	ActorPrincipalType   string             `json:"actor_principal_type"`
+	ActorPrincipalID     string             `json:"actor_principal_id"`
+	ActorCredentialClass string             `json:"actor_credential_class"`
+	ActorSessionID       pgtype.UUID        `json:"actor_session_id"`
+	ReasonCode           string             `json:"reason_code"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 }
 
 type Autopilot struct {
@@ -964,14 +1178,23 @@ type TaskMessage struct {
 }
 
 type TaskToken struct {
-	ID          pgtype.UUID        `json:"id"`
-	TokenHash   string             `json:"token_hash"`
-	TaskID      pgtype.UUID        `json:"task_id"`
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	UserID      pgtype.UUID        `json:"user_id"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	ID                       pgtype.UUID        `json:"id"`
+	TokenHash                string             `json:"token_hash"`
+	TaskID                   pgtype.UUID        `json:"task_id"`
+	AgentID                  pgtype.UUID        `json:"agent_id"`
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	UserID                   pgtype.UUID        `json:"user_id"`
+	ExpiresAt                pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	ProjectID                pgtype.UUID        `json:"project_id"`
+	IssueID                  pgtype.UUID        `json:"issue_id"`
+	LineageID                pgtype.UUID        `json:"lineage_id"`
+	AuthorizationSessionID   pgtype.UUID        `json:"authorization_session_id"`
+	AllowedActions           []string           `json:"allowed_actions"`
+	ExplicitDenies           []string           `json:"explicit_denies"`
+	DelegationDepthRemaining pgtype.Int4        `json:"delegation_depth_remaining"`
+	AllowedChildPrincipalIds []pgtype.UUID      `json:"allowed_child_principal_ids"`
+	CapabilityEnvelope       bool               `json:"capability_envelope"`
 }
 
 type TaskUsage struct {
@@ -1168,6 +1391,12 @@ type Workspace struct {
 	AvatarUrl    pgtype.Text        `json:"avatar_url"`
 	// When TRUE, an agent run that resolves to no precise accountable human (would be owner_fallback) is refused at enqueue instead of degrading to the agent owner (MUL-4302 §3.5). Default FALSE = owner_fallback. Never affects authorization (originator_user_id).
 	AttributionFailClosed bool `json:"attribution_fail_closed"`
+}
+
+type WorkspaceAuthorizationConfig struct {
+	WorkspaceID              pgtype.UUID        `json:"workspace_id"`
+	DesignatedApproverUserID pgtype.UUID        `json:"designated_approver_user_id"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WorkspaceInvitation struct {
