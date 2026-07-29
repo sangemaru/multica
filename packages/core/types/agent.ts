@@ -271,6 +271,19 @@ export interface AgentTask {
   // Empty string when the task is not in a failed state (the backend uses
   // `omitempty`, so the field may also be missing on non-failed tasks).
   failure_reason?: TaskFailureReason | "";
+  /**
+   * Two-phase running-task revocation. `server_access_denied` and
+   * `cancellation_requested` are not evidence that the runtime or host process
+   * has stopped; only host_termination_confirmed is.
+   */
+  revocation?: {
+    state: "cancellation_requested" | "runtime_acknowledged" | "terminated";
+    server_access_denied: boolean;
+    cancellation_requested_at: string | null;
+    runtime_acknowledged_at: string | null;
+    host_termination_confirmed: boolean;
+    host_termination_confirmed_at: string | null;
+  };
   created_at: string;
   /** Non-empty when the task was spawned from a chat session. */
   chat_session_id?: string;

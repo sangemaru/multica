@@ -16,11 +16,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/admission"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
 	composio "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
@@ -263,6 +265,11 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
 	taskSvc.Analytics = analyticsClient
+	// The normal server/handler construction path always persists authorization
+	// decisions. Stage 3 remains observe-only, but nil is reserved for isolated
+	// TaskService unit tests rather than becoming a production compatibility
+	// bypass.
+	taskSvc.Admission = admission.NewObserveOnlyEvaluator(queries, nil)
 	h := &Handler{
 		Queries:                      queries,
 		DB:                           executor,
@@ -504,69 +511,48 @@ func isCheckViolation(err error) bool {
 }
 
 func requestUserID(r *http.Request) string {
+	if id, ok := requestidentity.FromContext(r.Context()); ok {
+		return id.UserID
+	}
+	// Direct handler tests and a small number of middleware-less internal
+	// surfaces still inject the authenticated member header. It can identify a
+	// member in those compatibility paths, but it can never reclassify that
+	// member as an agent; resolveActor uses only server-derived context.
 	return r.Header.Get("X-User-ID")
+}
+
+// requestAgentTaskIdentity returns the task-bound identity installed by Auth.
+// It never falls back to wire headers.
+func requestAgentTaskIdentity(r *http.Request) (requestidentity.RequestIdentity, bool) {
+	id, ok := requestidentity.FromContext(r.Context())
+	if !ok || id.CredentialClass != requestidentity.CredentialAgentTaskToken || id.PrincipalType != requestidentity.PrincipalAgent {
+		return requestidentity.RequestIdentity{}, false
+	}
+	if id.AgentID == "" || id.TaskID == "" || id.WorkspaceID == "" {
+		return requestidentity.RequestIdentity{}, false
+	}
+	return id, true
 }
 
 // resolveActor determines whether the request is from an agent or a human member.
 //
-// First-class signal: X-Actor-Source set to "task_token" means the request
-// authenticated via an `mat_` task-scoped token. The auth middleware sets
-// that header (and stripped any client-supplied value first), so it is
-// authoritative — the bound (agent_id, task_id) cannot be forged or
-// stripped by the agent process. This is the path MUL-2600 relies on to
-// reject agent-process traffic on owner-only endpoints.
-//
-// Fallback signal (legacy CLI / member-token paths): the request MUST
-// carry both X-Agent-ID and a valid X-Task-ID, and the task must belong
-// to the claimed agent. Otherwise we fall back to "member".
-//
-// X-Agent-ID alone is not trusted: any workspace member can guess or observe
-// an agent's UUID, and a member-supplied X-Agent-ID would otherwise let that
-// member impersonate the agent and bypass the private-agent gate (#2359
-// review). The daemon always pairs the two headers, so requiring both has
-// no effect on legitimate agent callers but closes the impersonation path.
+// The only agent signal is the typed identity installed by Auth after an
+// `mat_` task token is validated. Client X-Agent-ID / X-Task-ID headers are
+// never consulted, even when they name a real task. This removes the legacy
+// actor-reclassification path and makes credential provenance authoritative.
 //
 // Returns ("agent", agentID) on success, ("member", userID) otherwise.
 func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
-	if r.Header.Get("X-Actor-Source") == "task_token" {
-		// Server-set header — auth middleware also forced X-Agent-ID
-		// from the token row. Trust it directly without re-querying.
-		return "agent", r.Header.Get("X-Agent-ID")
-	}
-	agentID := r.Header.Get("X-Agent-ID")
-	if agentID == "" {
+	id, ok := requestidentity.FromContext(r.Context())
+	if !ok || id.CredentialClass != requestidentity.CredentialAgentTaskToken || id.PrincipalType != requestidentity.PrincipalAgent {
 		return "member", userID
 	}
-	taskID := r.Header.Get("X-Task-ID")
-	if taskID == "" {
-		slog.Debug("resolveActor: X-Agent-ID present but X-Task-ID missing, refusing to trust agent identity", "agent_id", agentID)
+	if id.AgentID == "" || id.TaskID == "" || id.WorkspaceID == "" || id.WorkspaceID != workspaceID {
+		slog.Warn("resolveActor: incomplete or cross-workspace server identity",
+			"agent_id", id.AgentID, "task_id", id.TaskID, "bound_workspace_id", id.WorkspaceID, "requested_workspace_id", workspaceID)
 		return "member", userID
 	}
-
-	agentUUID, err := util.ParseUUID(agentID)
-	if err != nil {
-		slog.Debug("resolveActor: X-Agent-ID is not a valid UUID, falling back to member", "agent_id", agentID)
-		return "member", userID
-	}
-	// Validate the agent exists in the target workspace.
-	agent, err := h.Queries.GetAgent(r.Context(), agentUUID)
-	if err != nil || uuidToString(agent.WorkspaceID) != workspaceID {
-		slog.Debug("resolveActor: X-Agent-ID rejected, agent not found or workspace mismatch", "agent_id", agentID, "workspace_id", workspaceID)
-		return "member", userID
-	}
-
-	taskUUID, err := util.ParseUUID(taskID)
-	if err != nil {
-		slog.Debug("resolveActor: X-Task-ID is not a valid UUID, falling back to member", "task_id", taskID)
-		return "member", userID
-	}
-	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil || uuidToString(task.AgentID) != agentID {
-		slog.Debug("resolveActor: X-Task-ID rejected, task not found or agent mismatch", "agent_id", agentID, "task_id", taskID)
-		return "member", userID
-	}
-
-	return "agent", agentID
+	return "agent", id.AgentID
 }
 
 func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {

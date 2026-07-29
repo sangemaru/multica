@@ -29,6 +29,9 @@ func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, 
 	`, agentID, runtimeID, issueID).Scan(&id); err != nil {
 		t.Fatalf("seed queued task: %v", err)
 	}
+	if err := authorizeHandlerClaimFixtures(ctx, testWorkspaceID); err != nil {
+		t.Fatalf("authorize queued task fixture: %v", err)
+	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, id) })
 	return id
 }

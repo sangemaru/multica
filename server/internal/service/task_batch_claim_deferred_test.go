@@ -106,6 +106,7 @@ func deferredBatchFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool)
 		RETURNING id`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
 		t.Fatalf("create deferred task: %v", err)
 	}
+	authorizeTaskForClaim(t, pool, taskID)
 
 	t.Cleanup(func() {
 		c := context.Background()

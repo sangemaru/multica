@@ -1072,11 +1072,11 @@ export class ApiClient {
     return this.fetch(`/api/agents/${id}/restore`, { method: "POST" });
   }
 
-  // Bulk-cancel every active task (queued/dispatched/running) for the agent.
-  // Permission: agent owner or workspace admin/owner. Server returns the
-  // count of cancelled rows; broadcasts task:cancelled for each so other
-  // surfaces can clear their live cards.
-  async cancelAgentTasks(id: string): Promise<{ cancelled: number }> {
+  // Request cancellation for every active task. `cancelled` is already
+  // terminal; `cancellation_requested` is still running on its host.
+  async cancelAgentTasks(
+    id: string,
+  ): Promise<{ cancelled: number; cancellation_requested: number }> {
     return this.fetch(`/api/agents/${id}/cancel-tasks`, { method: "POST" });
   }
 

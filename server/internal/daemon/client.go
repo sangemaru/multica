@@ -346,6 +346,13 @@ func (c *Client) AckTaskCancelled(ctx context.Context, taskID string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-ack", taskID), map[string]any{}, nil)
 }
 
+// AckTaskCancellationObserved reports only that this runtime received the stop
+// signal. The later AckTaskCancelled call is the separate proof that the runner
+// returned and the local process is no longer executing.
+func (c *Client) AckTaskCancellationObserved(ctx context.Context, taskID string) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/cancel-observed", taskID), map[string]any{}, nil)
+}
+
 func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/progress", taskID), map[string]any{
 		"summary": summary,

@@ -75,22 +75,16 @@ func (h *Handler) GetChatThread(w http.ResponseWriter, r *http.Request) {
 }
 
 // chatHistorySession authorizes the request and returns the caller's own chat
-// session. It is authorized by the task-scoped token alone: middleware stamps
-// the token's task into X-Actor-Source=task_token + X-Task-ID (a normal JWT /
-// mul_ PAT leaves X-Actor-Source empty and does NOT strip a client-forged
-// X-Task-ID), so requiring the task-token actor is load-bearing — without it a
-// member could forge X-Task-ID and read another session's history.
+// session. It is authorized by the typed task identity that middleware derives
+// from a validated task token. Wire headers never select the task, so a member
+// cannot forge a task ID to read another session's history.
 func (h *Handler) chatHistorySession(w http.ResponseWriter, r *http.Request) (pgtype.UUID, bool) {
-	if r.Header.Get("X-Actor-Source") != "task_token" {
+	id, ok := requestAgentTaskIdentity(r)
+	if !ok {
 		writeError(w, http.StatusForbidden, "chat history is only available from within an agent task")
 		return pgtype.UUID{}, false
 	}
-	taskIDHeader := r.Header.Get("X-Task-ID")
-	if taskIDHeader == "" {
-		writeError(w, http.StatusBadRequest, "missing task context")
-		return pgtype.UUID{}, false
-	}
-	taskUUID, err := util.ParseUUID(taskIDHeader)
+	taskUUID, err := util.ParseUUID(id.TaskID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid task id")
 		return pgtype.UUID{}, false
@@ -100,7 +94,7 @@ func (h *Handler) chatHistorySession(w http.ResponseWriter, r *http.Request) (pg
 		writeError(w, http.StatusNotFound, "task not found")
 		return pgtype.UUID{}, false
 	}
-	if !task.ChatSessionID.Valid {
+	if uuidToString(task.AgentID) != id.AgentID || !task.ChatSessionID.Valid {
 		writeError(w, http.StatusBadRequest, "this task is not a chat task")
 		return pgtype.UUID{}, false
 	}

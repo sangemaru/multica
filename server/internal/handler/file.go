@@ -453,7 +453,8 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 			// X-Task-ID pair. So without this gate a member who learns a task ID
 			// could forge both headers and inject an attachment onto another chat
 			// task's assistant reply — a cross-session/privacy leak.
-			if r.Header.Get("X-Actor-Source") != "task_token" {
+			requestIdentity, authenticatedTask := requestAgentTaskIdentity(r)
+			if !authenticatedTask {
 				writeError(w, http.StatusForbidden, "task_id upload is only available from within an agent task")
 				return
 			}
@@ -466,7 +467,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 			// run authorized for task A cannot tag an attachment onto task B —
 			// even another chat task of the same agent, whose session may belong
 			// to a different user.
-			boundTaskID := strings.TrimSpace(r.Header.Get("X-Task-ID"))
+			boundTaskID := strings.TrimSpace(requestIdentity.TaskID)
 			if boundTaskID == "" || !strings.EqualFold(boundTaskID, strings.TrimSpace(taskID)) {
 				writeError(w, http.StatusForbidden, "task_id must match the request's task token")
 				return

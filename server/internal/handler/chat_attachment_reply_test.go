@@ -70,7 +70,7 @@ func assistantMessageForTask(t *testing.T, taskID string) (id, content string, o
 
 // doUpload performs a multipart upload of a task_id form field with the given
 // request headers, and returns the recorder.
-func doUpload(t *testing.T, formTaskID string, headers map[string]string) *httptest.ResponseRecorder {
+func doUpload(t *testing.T, formTaskID string, headers map[string]string, identityAgentID, identityTaskID string) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -89,15 +89,17 @@ func doUpload(t *testing.T, formTaskID string, headers map[string]string) *httpt
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	if identityAgentID != "" || identityTaskID != "" {
+		req = withAgentTaskIdentity(req, identityAgentID, identityTaskID)
+	}
 	w := httptest.NewRecorder()
 	testHandler.UploadFile(w, req)
 	return w
 }
 
 // uploadWithTaskID performs a multipart upload as a genuine task-token agent
-// request: it stamps the server-set X-Actor-Source=task_token + X-Task-ID pair
-// exactly as the auth middleware would for a `mat_` token (the boundary the
-// handler trusts). actorTaskID is what goes on X-Task-ID (the token's task);
+// request: it installs the typed identity the auth middleware derives from a
+// `mat_` token. actorTaskID is the token's bound task;
 // formTaskID is the upload's task_id form field. They match in the happy path.
 // When agentID is empty the caller is a plain member (no task-token headers).
 func uploadWithTaskID(t *testing.T, agentID, actorTaskID, formTaskID string) *httptest.ResponseRecorder {
@@ -106,15 +108,7 @@ func uploadWithTaskID(t *testing.T, agentID, actorTaskID, formTaskID string) *ht
 		"X-User-ID":      testUserID,
 		"X-Workspace-ID": testWorkspaceID,
 	}
-	if agentID != "" {
-		// Mirror the middleware: a task token stamps the actor source and task.
-		headers["X-Actor-Source"] = "task_token"
-		headers["X-Agent-ID"] = agentID
-	}
-	if actorTaskID != "" {
-		headers["X-Task-ID"] = actorTaskID
-	}
-	return doUpload(t, formTaskID, headers)
+	return doUpload(t, formTaskID, headers, agentID, actorTaskID)
 }
 
 // TestUploadFile_TaskScopedChatAttachment covers the write side: an agent
@@ -187,7 +181,7 @@ func TestUploadFile_TaskScopedChatAttachment(t *testing.T) {
 			"X-Agent-ID":     agentID,
 			"X-Task-ID":      taskID,
 			// deliberately NO X-Actor-Source
-		})
+		}, "", "")
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("forged non-task-token upload: expected 403, got %d: %s", w.Code, w.Body.String())
 		}

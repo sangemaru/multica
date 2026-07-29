@@ -242,8 +242,7 @@ func TestSubscriberAPI(t *testing.T) {
 		w := httptest.NewRecorder()
 		req := newRequest("POST", "/api/issues/"+issueID+"/subscribe", nil)
 		req = withURLParam(req, "id", issueID)
-		req.Header.Set("X-Agent-ID", agentID)
-		req.Header.Set("X-Task-ID", agentTask)
+		req = withAgentTaskIdentity(req, agentID, agentTask)
 		testHandler.SubscribeToIssue(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("SubscribeToIssue (agent caller): expected 200, got %d: %s", w.Code, w.Body.String())
@@ -279,8 +278,7 @@ func TestSubscriberAPI(t *testing.T) {
 		w = httptest.NewRecorder()
 		req = newRequest("POST", "/api/issues/"+issueID+"/unsubscribe", nil)
 		req = withURLParam(req, "id", issueID)
-		req.Header.Set("X-Agent-ID", agentID)
-		req.Header.Set("X-Task-ID", agentTask)
+		req = withAgentTaskIdentity(req, agentID, agentTask)
 		testHandler.UnsubscribeFromIssue(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("UnsubscribeFromIssue (agent caller): expected 200, got %d: %s", w.Code, w.Body.String())

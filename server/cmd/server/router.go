@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/multica-ai/multica/server/internal/admission"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
@@ -221,6 +222,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
+	h.TaskService.Admission = admission.NewEvaluator(
+		queries,
+		opts.BusinessMetrics,
+		strings.EqualFold(strings.TrimSpace(os.Getenv("AUTHORIZATION_CREDENTIAL_ENFORCEMENT")), "enforce"),
+	)
 	h.IssueService.Metrics = opts.BusinessMetrics
 	if opts.BusinessMetrics != nil {
 		// Wire the BusinessMetrics receiver into the cloud runtime client
@@ -797,6 +803,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/usage", h.ReportTaskUsage)
 		r.Post("/tasks/{taskId}/messages", h.ReportTaskMessages)
 		r.Get("/tasks/{taskId}/messages", h.ListTaskMessages)
+		r.Post("/tasks/{taskId}/cancel-observed", h.AckTaskCancellationObserved)
 		r.Post("/tasks/{taskId}/cancel-ack", h.AckTaskCancelled)
 
 		r.Post("/workspaces/{workspaceId}/issues/gc-check", h.BatchIssueGCCheck)
@@ -863,6 +870,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/members", h.ListMembersWithUser)
 					r.Post("/leave", h.LeaveWorkspace)
 					r.Get("/invitations", h.ListWorkspaceInvitations)
+					r.Get("/authorization/approver", h.GetAuthorizationApprover)
+					r.Get("/authorization/policies", h.ListAuthorizationPolicies)
+					r.Get("/authorization/decisions", h.ListAuthorizationDecisionExplanations)
+					r.Get("/authorization/decisions/{decisionId}", h.GetAuthorizationDecisionExplanation)
+					r.Post("/authorization/approval-cases", h.CreateAuthorizationApprovalCase)
+					r.Get("/authorization/approval-cases/{caseId}", h.GetAuthorizationApprovalCase)
+					r.Post("/authorization/approval-cases/{caseId}/transitions", h.TransitionAuthorizationApprovalCase)
 					// Listing GitHub installations is member-visible so the
 					// integrations tab no longer renders blank for non-admins;
 					// the handler strips the management handle and adds a
@@ -893,6 +907,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
+				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Put("/authorization/approver", h.SetAuthorizationApprover)
+				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Post("/authorization/policies", h.PublishAuthorizationPolicy)
+				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Put("/authorization/agents/{agentId}/class", h.SetAgentAuthorizationClass)
 
 				// GitHub integration — connect / disconnect remain admin-only;
 				// the read-only list endpoint lives in the member-level group
@@ -987,6 +1004,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Delete("/{id}", h.RevokePersonalAccessToken)
 		})
 
+		r.Route("/api/authorization/sessions", func(r chi.Router) {
+			r.Get("/", h.ListAuthorizationSessions)
+			r.Post("/exchange", h.ExchangeAuthorizationSession)
+			r.Post("/{id}/rotate", h.RotateAuthorizationSession)
+			r.Delete("/{id}", h.RevokeAuthorizationSession)
+		})
+
 		// Cloud Billing proxy. Same upstream service / port as
 		// cloud-runtime — multica-cloud's Fleet and Billing share
 		// :8080 and the same chi router. All routes here forward
@@ -1012,7 +1036,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		// any task-token request. See actor_guards.go for the full
 		// rationale.
 		r.Route("/api/cloud-billing", func(r chi.Router) {
-			r.Use(handler.RequireHumanActor)
+			r.Use(handler.RequireHumanActorWithEnforcement(
+				strings.EqualFold(strings.TrimSpace(os.Getenv("AUTHORIZATION_PROTECTED_HUMAN_ENFORCEMENT")), "enforce"),
+			))
 
 			r.Get("/balance", h.GetCloudBillingBalance)
 			r.Get("/transactions", h.ListCloudBillingTransactions)

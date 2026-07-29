@@ -1,0 +1,6 @@
+DROP TRIGGER IF EXISTS authorization_approval_case_projection_guard ON authorization_approval_case;
+DROP FUNCTION IF EXISTS enforce_authorization_approval_case_projection();
+DROP TRIGGER IF EXISTS authorization_approval_case_event_append_only ON authorization_approval_case_event;
+DROP FUNCTION IF EXISTS prevent_authorization_approval_case_event_mutation();
+DROP TABLE IF EXISTS authorization_approval_case_event;
+DROP TABLE IF EXISTS authorization_approval_case;

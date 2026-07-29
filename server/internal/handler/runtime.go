@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -714,6 +715,9 @@ func (h *Handler) DeleteAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "cannot delete runtime: it has active squads led by archived agents. Archive those squads or assign them a new leader first.")
 		return
 	}
+	if h.requestRuntimeTaskTermination(w, r, []pgtype.UUID{rt.ID}, nil) {
+		return
+	}
 
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
@@ -923,6 +927,29 @@ func (h *Handler) ArchiveAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.R
 			"deleted_by", userID)
 	}
 
+	// The caller explicitly confirmed this cascade plan. Deny all task access
+	// now, but do not erase runtime/agent rows until every started host process
+	// has positively confirmed termination.
+	currentPlan, err := h.Queries.ListActiveAgentsByRuntime(r.Context(), rt.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to enumerate active agents")
+		return
+	}
+	if !activeAgentSetMatches(currentPlan, expected) {
+		body := runtimeHasActiveAgentsResponse(currentPlan)
+		body["code"] = "runtime_delete_plan_changed"
+		body["error"] = "the active agent set changed; please review and confirm again."
+		writeJSON(w, http.StatusConflict, body)
+		return
+	}
+	agentIDs := make([]pgtype.UUID, len(currentPlan))
+	for i, agent := range currentPlan {
+		agentIDs[i] = agent.ID
+	}
+	if h.requestRuntimeTaskTermination(w, r, []pgtype.UUID{rt.ID}, agentIDs) {
+		return
+	}
+
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to start transaction")
@@ -1105,6 +1132,52 @@ func (h *Handler) ArchiveAgentsAndDeleteRuntime(w http.ResponseWriter, r *http.R
 		"agents_archived": len(archivedAgents),
 		"tasks_cancelled": len(cancelledTasks),
 	})
+}
+
+// requestRuntimeTaskTermination returns true after writing a response. A
+// pending response is intentionally a conflict/retry boundary: server access
+// is already denied, but deleting runtime or agent rows would destroy the
+// durable task identity needed for the runtime's termination acknowledgement.
+func (h *Handler) requestRuntimeTaskTermination(
+	w http.ResponseWriter,
+	r *http.Request,
+	runtimeIDs []pgtype.UUID,
+	agentIDs []pgtype.UUID,
+) bool {
+	tasks, err := h.Queries.ListCancellableAgentTasksByRuntimeOrAgent(
+		r.Context(),
+		db.ListCancellableAgentTasksByRuntimeOrAgentParams{
+			RuntimeIds: runtimeIDs,
+			AgentIds:   agentIDs,
+		},
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to enumerate runtime tasks")
+		return true
+	}
+	pending := 0
+	for _, task := range tasks {
+		updated, cancelErr := h.TaskService.CancelTask(r.Context(), task.ID)
+		if cancelErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to request runtime task cancellation")
+			return true
+		}
+		if updated.CancellationRequestedAt.Valid && !updated.TerminationConfirmedAt.Valid {
+			pending++
+		}
+	}
+	if pending == 0 {
+		return false
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"code":                         "task_termination_pending",
+		"error":                        service.ErrTaskTerminationPending.Error(),
+		"pending_host_termination":     pending,
+		"server_access_denied":         true,
+		"host_termination_confirmed":   false,
+		"retry_after_runtime_confirms": true,
+	})
+	return true
 }
 
 // parseExpectedActiveAgentIDs validates the cascade endpoint's

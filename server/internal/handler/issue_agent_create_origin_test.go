@@ -46,8 +46,7 @@ func TestCreateIssue_AgentCreate_StampsActingTaskOrigin(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title": "Agent-created via normal create (MUL-4305)",
 	})
-	req.Header.Set("X-Agent-ID", agentID)
-	req.Header.Set("X-Task-ID", taskID)
+	req = withAgentTaskIdentity(req, agentID, taskID)
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())

@@ -395,8 +395,8 @@ func TestAgentEnv_AgentActorRejected(t *testing.T) {
 		t.Fatalf("failed to set custom_env: %v", err)
 	}
 
-	// Spin up a separate agent + task that authorises the X-Agent-ID /
-	// X-Task-ID header pair resolveActor checks. The owning member of
+	// Spin up a separate agent + task whose authenticated task-token identity
+	// resolveActor checks. The owning member of
 	// the host agent is the same testUserID (workspace owner), which is
 	// the exact lateral-movement shape we want to block.
 	hostAgentID := createHandlerTestAgent(t, "env-host-agent", nil)
@@ -418,8 +418,7 @@ func TestAgentEnv_AgentActorRejected(t *testing.T) {
 			}
 			req := newRequest(method, "/api/agents/"+targetID+"/env", tc.body)
 			req = withURLParam(req, "id", targetID)
-			req.Header.Set("X-Agent-ID", hostAgentID)
-			req.Header.Set("X-Task-ID", hostTaskID)
+			req = withAgentTaskIdentity(req, hostAgentID, hostTaskID)
 			w := httptest.NewRecorder()
 			tc.fn(w, req)
 			if w.Code != http.StatusForbidden {
@@ -430,13 +429,10 @@ func TestAgentEnv_AgentActorRejected(t *testing.T) {
 }
 
 // TestAgentEnv_TaskTokenActorSource locks in the post-MUL-2600 attack
-// model: an agent process that strips its identifying headers
-// (X-Agent-ID / X-Task-ID) but is still authenticated by an `mat_`
-// task token MUST be recognized as actor=agent and rejected on the
-// env endpoint. The auth middleware sets X-Actor-Source=task_token
-// from the token row; resolveActor honors that header before the
-// header-pair fallback. Without this guard the lateral-movement fix
-// would only block "honest" CLIs that voluntarily set both headers.
+// model: an agent process authenticated by an `mat_` task token MUST be
+// recognized as actor=agent and rejected on the env endpoint. The auth
+// middleware installs a typed identity derived from the token row; client
+// headers do not participate in this decision.
 func TestAgentEnv_TaskTokenActorSource(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -447,20 +443,15 @@ func TestAgentEnv_TaskTokenActorSource(t *testing.T) {
 		t.Fatalf("failed to set custom_env: %v", err)
 	}
 
+	hostAgentID := createHandlerTestAgent(t, "env-tt-host-agent", nil)
+	hostTaskID := createHandlerTestTaskForAgent(t, hostAgentID)
 	req := newRequest(http.MethodGet, "/api/agents/"+targetID+"/env", nil)
 	req = withURLParam(req, "id", targetID)
-	// Simulate the auth middleware's post-mat_-resolution state: the
-	// only header touching actor identity is X-Actor-Source. The agent
-	// process stripped X-Agent-ID and X-Task-ID, hoping to fall back
-	// to the member auth path — the server-set X-Actor-Source must
-	// short-circuit that escape.
-	req.Header.Set("X-Actor-Source", "task_token")
-	req.Header.Del("X-Agent-ID")
-	req.Header.Del("X-Task-ID")
+	req = withAgentTaskIdentity(req, hostAgentID, hostTaskID)
 	w := httptest.NewRecorder()
 	testHandler.GetAgentEnv(w, req)
 	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 when X-Actor-Source=task_token, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected 403 for task-token identity, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -685,8 +676,8 @@ func TestAgentResponseShape_HasNoLegacyEnvFields(t *testing.T) {
 }
 
 // TestUpdateAgent_RedactsMcpConfigForAgentActor closes the second leg
-// of MUL-2600 review #2: an agent process with a task token (or with
-// the X-Actor-Source server marker) must not be able to scrape another
+// of MUL-2600 review #2: an agent process with a task token must not
+// be able to scrape another
 // agent's mcp_config via an unrelated mutation response. Even when the
 // host PAT would otherwise satisfy canManageAgent, the response body
 // must come back with mcp_config redacted.
@@ -702,7 +693,7 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 
 	// A second agent acts as the "calling" agent process whose task
 	// token authenticated the request. It is registered in the same
-	// workspace so resolveActor recognises X-Agent-ID as valid.
+	// workspace so the task-token identity is a valid caller.
 	caller := createHandlerTestAgent(t, "mut-mcp-caller", nil)
 	taskID := insertHandlerTestTask(t, caller)
 
@@ -711,13 +702,7 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 		"description": desc,
 	})
 	req = withURLParam(req, "id", target)
-	// Simulate a task-token-authenticated agent request. The auth
-	// middleware would normally set these; we mimic both the modern
-	// path (X-Actor-Source) and the legacy header pair so the test is
-	// resilient to either resolveActor branch.
-	req.Header.Set("X-Actor-Source", "task_token")
-	req.Header.Set("X-Agent-ID", caller)
-	req.Header.Set("X-Task-ID", taskID)
+	req = withAgentTaskIdentity(req, caller, taskID)
 	w := httptest.NewRecorder()
 	testHandler.UpdateAgent(w, req)
 	if w.Code != http.StatusOK {

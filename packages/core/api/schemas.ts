@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type {
   Agent,
+  AuthorizationDecisionExplanation,
   AgentTemplate,
   AgentTemplateSummary,
   AgentBuilderSession,
@@ -37,6 +38,34 @@ import type {
   User,
   WebhookDelivery,
 } from "../types";
+
+export const AuthorizationDecisionExplanationSchema: z.ZodType<AuthorizationDecisionExplanation> = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  task_id: z.string().optional(),
+  path: z.string(),
+  evaluation_phase: z.string(),
+  action: z.string(),
+  principal_type: z.string(),
+  principal_id: z.string().optional(),
+  credential_class: z.string(),
+  outcome: z.enum(["allowed", "denied", "observed_deny"]),
+  enforcement: z.enum(["enforced", "observe_only"]),
+  reason_code: z.string(),
+  policy_version: z.string(),
+  policy_layer: z.string(),
+  explanation: z.string(),
+  next_step: z.string(),
+  task_created: z.boolean(),
+  provider_call_status: z.enum(["not_reached", "not_recorded_by_authorization_ledger"]),
+  allowed_actions: z.array(z.string()).optional(),
+  explicit_denies: z.array(z.string()).optional(),
+  created_at: z.string(),
+}).loose();
+
+export const AuthorizationDecisionExplanationListSchema = z.array(
+  AuthorizationDecisionExplanationSchema,
+);
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
 
@@ -763,6 +792,15 @@ const OptionalStringArraySchema = z.preprocess(
   z.array(z.string()).optional(),
 );
 
+const TaskRevocationSchema = z.object({
+  state: z.enum(["cancellation_requested", "runtime_acknowledged", "terminated"]),
+  server_access_denied: z.boolean(),
+  cancellation_requested_at: z.string().nullable(),
+  runtime_acknowledged_at: z.string().nullable(),
+  host_termination_confirmed: z.boolean(),
+  host_termination_confirmed_at: z.string().nullable(),
+}).loose();
+
 export const AgentTaskSchema = z.object({
   id: z.string(),
   agent_id: z.string().default(""),
@@ -776,6 +814,7 @@ export const AgentTaskSchema = z.object({
   result: z.unknown().default(null),
   error: z.string().nullable().default(null),
   failure_reason: z.string().optional(),
+  revocation: TaskRevocationSchema.optional(),
   created_at: z.string().default(""),
   chat_session_id: z.string().optional(),
   autopilot_run_id: z.string().optional(),

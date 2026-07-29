@@ -179,6 +179,9 @@ func createCommentDeliveryFixture(t *testing.T, label string) commentDeliveryFix
 	`, agentID, runtimeID, issueID, ids[2], ids[1], ids[0]).Scan(&taskID); err != nil {
 		t.Fatalf("insert comment delivery task: %v", err)
 	}
+	if err := authorizeHandlerClaimFixtures(ctx, testWorkspaceID); err != nil {
+		t.Fatalf("authorize comment delivery task fixture: %v", err)
+	}
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
 	})
@@ -689,6 +692,9 @@ func TestRerunIssue_PreservesSourceCommentPlanAndResetsReceipt(t *testing.T) {
 		RETURNING id
 	`, agentID, runtimeID, issueID, commentIDs[2], commentIDs[0], commentIDs[1]).Scan(&sourceID); err != nil {
 		t.Fatalf("insert manual rerun source: %v", err)
+	}
+	if err := authorizeHandlerClaimFixtures(ctx, testWorkspaceID); err != nil {
+		t.Fatalf("authorize manual rerun source fixture: %v", err)
 	}
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)

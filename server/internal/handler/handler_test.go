@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -177,6 +178,38 @@ func newRequest(method, path string, body any) *http.Request {
 	return req
 }
 
+// withAgentTaskIdentity installs the authenticated identity that Auth derives
+// from a valid task token. Tests use this helper instead of identity headers,
+// which are untrusted input and must never select an agent principal.
+func withAgentTaskIdentity(req *http.Request, agentID, taskID string) *http.Request {
+	if testPool != nil && testWorkspaceID != "" {
+		if err := authorizeHandlerClaimFixtures(context.Background(), testWorkspaceID); err != nil {
+			panic("authorize handler agent identity fixture: " + err.Error())
+		}
+	}
+	id := requestidentity.RequestIdentity{
+		PrincipalType:   requestidentity.PrincipalAgent,
+		PrincipalID:     agentID,
+		CredentialClass: requestidentity.CredentialAgentTaskToken,
+		UserID:          testUserID,
+		AgentID:         agentID,
+		TaskID:          taskID,
+		WorkspaceID:     testWorkspaceID,
+	}
+	return req.WithContext(requestidentity.WithRequest(req.Context(), id))
+}
+
+func agentIDForHandlerTestTask(t *testing.T, taskID string) string {
+	t.Helper()
+	var agentID string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT agent_id::text FROM agent_task_queue WHERE id = $1`, taskID,
+	).Scan(&agentID); err != nil {
+		t.Fatalf("load agent for task %s: %v", taskID, err)
+	}
+	return agentID
+}
+
 func withURLParam(req *http.Request, key, value string) *http.Request {
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add(key, value)
@@ -287,10 +320,98 @@ func createHandlerTestTaskForAgentOnIssue(t *testing.T, agentID, issueID string)
 	`, agentID, handlerTestRuntimeID(t), issueArg).Scan(&taskID); err != nil {
 		t.Fatalf("failed to create handler test task: %v", err)
 	}
+	if err := authorizeHandlerClaimFixtures(context.Background(), testWorkspaceID); err != nil {
+		t.Fatalf("authorize handler task fixture: %v", err)
+	}
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
 	})
 	return taskID
+}
+
+// authorizeHandlerClaimFixtures upgrades deliberately low-level test rows to
+// the same authorization tuple migration 210 gives rollout work. It covers
+// both claimable rows and terminal rows later used as rerun/delegation parents.
+// This is test-only compatibility scaffolding: production claim and delegation
+// code still reject any row missing a decision, policy version, immutable
+// lineage, or reservation.
+func authorizeHandlerClaimFixtures(ctx context.Context, workspaceID string) error {
+	_, err := testPool.Exec(ctx, `
+		WITH candidates AS (
+			SELECT
+				t.id AS task_id,
+				t.agent_id,
+				t.issue_id,
+				a.workspace_id,
+				i.project_id,
+				gen_random_uuid() AS lineage_id,
+				CASE
+					WHEN t.chat_session_id IS NOT NULL THEN 'chat'
+					WHEN t.autopilot_run_id IS NOT NULL THEN 'autopilot'
+					WHEN t.issue_id IS NOT NULL THEN 'issue_assignee'
+					ELSE 'quick_create'
+				END AS path,
+				CASE
+					WHEN t.status IN ('queued', 'deferred', 'dispatched', 'waiting_local_directory')
+						AND t.started_at IS NULL THEN 'reserved'
+					ELSE 'consumed'
+				END AS reservation_status,
+				COALESCE(t.started_at, t.dispatched_at, t.completed_at, t.created_at) AS consumed_at
+			FROM agent_task_queue t
+			JOIN agent a ON a.id = t.agent_id
+			LEFT JOIN issue i ON i.id = t.issue_id
+			WHERE a.workspace_id = $1
+			  AND t.admission_decision_id IS NULL
+			  AND t.authorization_policy_version IS NULL
+			  AND t.lineage_id IS NULL
+			  AND t.budget_reservation_id IS NULL
+		), decisions AS (
+			INSERT INTO authorization_decision (
+				id, path, action, principal_type, principal_id, credential_class,
+				workspace_id, project_id, issue_id, agent_id,
+				allowed, reason_code, policy_version, observe_only, lineage_id
+			)
+			SELECT
+				c.task_id, c.path, 'agent:invoke', 'agent', c.agent_id, 'agent_task_token',
+				c.workspace_id, c.project_id, c.issue_id, c.agent_id,
+				TRUE, 'test_fixture_compatibility_allow', 'observe-v1', FALSE, c.lineage_id
+			FROM candidates c
+			RETURNING id, policy_version, lineage_id, workspace_id
+		), budgets AS (
+			INSERT INTO authorization_lineage_budget (
+				lineage_id, workspace_id, execution_limit, reserved_executions, consumed_executions
+			)
+			SELECT
+				d.lineage_id, d.workspace_id, 64,
+				CASE WHEN c.reservation_status = 'reserved' THEN 1 ELSE 0 END,
+				CASE WHEN c.reservation_status = 'consumed' THEN 1 ELSE 0 END
+			FROM decisions d
+			JOIN candidates c ON c.task_id = d.id
+			RETURNING lineage_id
+		), reservations AS (
+			INSERT INTO authorization_budget_reservation (
+				lineage_id, admission_decision_id, generation, status, task_id,
+				expires_at, consumed_at
+			)
+			SELECT
+				d.lineage_id, d.id, 1, c.reservation_status, c.task_id,
+				now() + interval '100 years',
+				CASE WHEN c.reservation_status = 'consumed' THEN c.consumed_at ELSE NULL END
+			FROM decisions d
+			JOIN candidates c ON c.task_id = d.id
+			JOIN budgets b ON b.lineage_id = d.lineage_id
+			RETURNING id, admission_decision_id, lineage_id
+		)
+		UPDATE agent_task_queue t
+		SET admission_decision_id = d.id,
+			authorization_policy_version = d.policy_version,
+			lineage_id = d.lineage_id,
+			budget_reservation_id = r.id
+		FROM decisions d
+		JOIN reservations r ON r.admission_decision_id = d.id
+		WHERE t.id = d.id
+	`, workspaceID)
+	return err
 }
 
 func fetchAgentMcpConfig(t *testing.T, agentID string) []byte {
@@ -2958,11 +3079,12 @@ func TestResolveActor(t *testing.T) {
 	})
 
 	tests := []struct {
-		name          string
-		agentIDHeader string
-		taskIDHeader  string
-		wantActorType string
-		wantIsAgent   bool
+		name           string
+		agentIDHeader  string
+		taskIDHeader   string
+		serverIdentity bool
+		wantActorType  string
+		wantIsAgent    bool
 	}{
 		{
 			name:          "no headers returns member",
@@ -2984,11 +3106,16 @@ func TestResolveActor(t *testing.T) {
 			wantActorType: "member",
 		},
 		{
-			name:          "valid agent + valid task returns agent",
+			name:          "valid client agent + task headers still return member",
 			agentIDHeader: agentID,
 			taskIDHeader:  taskID,
-			wantActorType: "agent",
-			wantIsAgent:   true,
+			wantActorType: "member",
+		},
+		{
+			name:           "server-derived task identity returns agent",
+			serverIdentity: true,
+			wantActorType:  "agent",
+			wantIsAgent:    true,
 		},
 		{
 			name:          "valid agent + wrong task returns member",
@@ -3007,6 +3134,17 @@ func TestResolveActor(t *testing.T) {
 			if tt.taskIDHeader != "" {
 				req.Header.Set("X-Task-ID", tt.taskIDHeader)
 			}
+			if tt.serverIdentity {
+				req = req.WithContext(requestidentity.WithRequest(req.Context(), requestidentity.RequestIdentity{
+					PrincipalType:   requestidentity.PrincipalAgent,
+					PrincipalID:     agentID,
+					CredentialClass: requestidentity.CredentialAgentTaskToken,
+					UserID:          testUserID,
+					AgentID:         agentID,
+					TaskID:          taskID,
+					WorkspaceID:     testWorkspaceID,
+				}))
+			}
 
 			actorType, actorID := testHandler.resolveActor(req, testUserID, testWorkspaceID)
 
@@ -3014,8 +3152,8 @@ func TestResolveActor(t *testing.T) {
 				t.Errorf("actorType = %q, want %q", actorType, tt.wantActorType)
 			}
 			if tt.wantIsAgent {
-				if actorID != tt.agentIDHeader {
-					t.Errorf("actorID = %q, want agent %q", actorID, tt.agentIDHeader)
+				if actorID != agentID {
+					t.Errorf("actorID = %q, want agent %q", actorID, agentID)
 				}
 			} else {
 				if actorID != testUserID {
@@ -3177,8 +3315,7 @@ func TestBacklogToTodoByAgentTriggersDifferentAssignee(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
 	req = withURLParam(req, "id", created.ID)
-	req.Header.Set("X-Agent-ID", parentAgent)
-	req.Header.Set("X-Task-ID", parentTask)
+	req = withAgentTaskIdentity(req, parentAgent, parentTask)
 	testHandler.UpdateIssue(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -3239,8 +3376,7 @@ func TestBacklogToTodoByAgentSameIssueDoesNotSelfTrigger(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
 	req = withURLParam(req, "id", created.ID)
-	req.Header.Set("X-Agent-ID", selfAgent)
-	req.Header.Set("X-Task-ID", selfTask)
+	req = withAgentTaskIdentity(req, selfAgent, selfTask)
 	testHandler.UpdateIssue(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -3316,8 +3452,7 @@ func TestBacklogToTodoByAgentSameAgentDifferentIssue(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+step2.ID, map[string]any{"status": "todo"})
 	req = withURLParam(req, "id", step2.ID)
-	req.Header.Set("X-Agent-ID", agentID)
-	req.Header.Set("X-Task-ID", step1Task)
+	req = withAgentTaskIdentity(req, agentID, step1Task)
 	testHandler.UpdateIssue(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("UpdateIssue step2: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -3374,8 +3509,7 @@ func TestBatchBacklogToTodoByAgentTriggersAssignee(t *testing.T) {
 		"issue_ids": []string{created.ID},
 		"updates":   map[string]any{"status": "todo"},
 	})
-	req.Header.Set("X-Agent-ID", parentAgent)
-	req.Header.Set("X-Task-ID", parentTask)
+	req = withAgentTaskIdentity(req, parentAgent, parentTask)
 	testHandler.BatchUpdateIssues(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -3442,8 +3576,7 @@ func TestBacklogToTodoByAgentTriggersSquadLeader(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
 	req = withURLParam(req, "id", created.ID)
-	req.Header.Set("X-Agent-ID", driverAgent)
-	req.Header.Set("X-Task-ID", driverTask)
+	req = withAgentTaskIdentity(req, driverAgent, driverTask)
 	testHandler.UpdateIssue(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -3538,12 +3671,12 @@ func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 		}
 	}
 
-	postComment := func(issueID string, body map[string]any, headers map[string]string) *httptest.ResponseRecorder {
+	postComment := func(issueID string, body map[string]any, agentID, taskID string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
 		r := newRequest("POST", "/api/issues/"+issueID+"/comments", body)
 		r = withURLParam(r, "id", issueID)
-		for k, v := range headers {
-			r.Header.Set(k, v)
+		if agentID != "" || taskID != "" {
+			r = withAgentTaskIdentity(r, agentID, taskID)
 		}
 		testHandler.CreateComment(w, r)
 		return w
@@ -3551,7 +3684,7 @@ func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 
 	// 1. Member posts top-level comment mentioning Agent B.
 	mentionB := fmt.Sprintf("[@Agent B](mention://agent/%s) please review", agentB)
-	w = postComment(issueID, map[string]any{"content": mentionB}, nil)
+	w = postComment(issueID, map[string]any{"content": mentionB}, "", "")
 	if w.Code != http.StatusCreated {
 		t.Fatalf("member mention comment: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -3569,13 +3702,12 @@ func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 
 	// 3. Agent A posts a reply in the same thread with NO mentions.
 	// Agent-authored comments still do not inherit the root mention of Agent B.
-	// resolveActor requires X-Task-ID paired with X-Agent-ID to trust the
-	// agent identity, so we seed a task that belongs to agent A.
+	// Seed the task bound into agent A's authenticated request identity.
 	agentATask := createHandlerTestTaskForAgent(t, agentA)
 	w = postComment(issueID, map[string]any{
 		"content":   "No reply needed — just an acknowledgment.",
 		"parent_id": parentComment.ID,
-	}, map[string]string{"X-Agent-ID": agentA, "X-Task-ID": agentATask})
+	}, agentA, agentATask)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("agent A reply: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -3591,7 +3723,7 @@ func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 	w = postComment(issueID, map[string]any{
 		"content":   "Thanks for the review.",
 		"parent_id": parentComment.ID,
-	}, nil)
+	}, "", "")
 	if w.Code != http.StatusCreated {
 		t.Fatalf("member reply: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -3656,8 +3788,7 @@ func TestMemberReplyToAgentRootDoesNotInheritParentMentions(t *testing.T) {
 		"content": fmt.Sprintf("PR ready. [@Reviewer](mention://agent/%s) please review this.", reviewerAgent),
 	})
 	r = withURLParam(r, "id", issueID)
-	r.Header.Set("X-Agent-ID", jAgent)
-	r.Header.Set("X-Task-ID", jAgentTask)
+	r = withAgentTaskIdentity(r, jAgent, jAgentTask)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("J PR completion: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -3947,8 +4078,7 @@ func TestAgentExplicitMentionStillTriggers(t *testing.T) {
 		"content": explicitMention,
 	})
 	r = withURLParam(r, "id", issueID)
-	r.Header.Set("X-Agent-ID", agentA)
-	r.Header.Set("X-Task-ID", agentATask)
+	r = withAgentTaskIdentity(r, agentA, agentATask)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("agent A handoff: expected 201, got %d: %s", w.Code, w.Body.String())

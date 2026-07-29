@@ -179,8 +179,8 @@ func memberAllowedToViewAgent(agent db.Agent, targets []db.AgentInvocationTarget
 
 // invokeOriginatorFromRequest resolves the top-of-chain human user id for an
 // invocation initiated over HTTP. Members are their own originator; agent
-// actors inherit the originator from the task named by the X-Task-ID header
-// (set by the CLI on every request), matching
+// actors inherit the originator from the server-authenticated task identity,
+// matching
 // TaskService.resolveOriginatorFromTriggerComment. Returns "" when no human
 // can be attributed — canInvokeAgent then fails closed for member/team targets.
 func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorID string) string {
@@ -188,9 +188,9 @@ func (h *Handler) invokeOriginatorFromRequest(r *http.Request, actorType, actorI
 		return actorID
 	}
 	if actorType == "agent" {
-		if taskIDHeader := r.Header.Get("X-Task-ID"); taskIDHeader != "" {
-			if taskUUID, err := util.ParseUUID(taskIDHeader); err == nil {
-				if task, err := h.Queries.GetAgentTask(r.Context(), taskUUID); err == nil {
+		if id, ok := requestAgentTaskIdentity(r); ok && id.AgentID == actorID {
+			if taskUUID, err := util.ParseUUID(id.TaskID); err == nil {
+				if task, err := h.Queries.GetAgentTask(r.Context(), taskUUID); err == nil && uuidToString(task.AgentID) == id.AgentID {
 					return uuidToString(task.OriginatorUserID)
 				}
 			}
@@ -276,7 +276,7 @@ func (h *Handler) autopilotDelegationAuthorityFromRequest(r *http.Request, issue
 	if actorType != "agent" {
 		return ""
 	}
-	task, ok := h.taskFromRequestHeader(r)
+	task, ok := h.taskFromRequestIdentity(r)
 	if !ok {
 		return ""
 	}
@@ -306,27 +306,26 @@ func (h *Handler) autopilotDelegationAuthorityFromComment(ctx context.Context, i
 // lineage — and every authority/originator resolution that reads it — fails closed
 // (MUL-4857).
 func (h *Handler) commentSourceTaskIDForIssue(r *http.Request, issue db.Issue) pgtype.UUID {
-	task, ok := h.taskFromRequestHeader(r)
+	task, ok := h.taskFromRequestIdentity(r)
 	if !ok || !task.IssueID.Valid || uuidToString(task.IssueID) != uuidToString(issue.ID) {
 		return pgtype.UUID{}
 	}
 	return task.ID
 }
 
-// taskFromRequestHeader resolves the agent's currently-executing task from the
-// X-Task-ID header (set by the CLI on every request). Returns ok=false when the
-// header is absent, malformed, or names no existing task.
-func (h *Handler) taskFromRequestHeader(r *http.Request) (db.AgentTaskQueue, bool) {
-	taskIDHeader := r.Header.Get("X-Task-ID")
-	if taskIDHeader == "" {
+// taskFromRequestIdentity resolves the agent's currently-executing task from
+// the server-derived task-token identity. Wire headers never select this task.
+func (h *Handler) taskFromRequestIdentity(r *http.Request) (db.AgentTaskQueue, bool) {
+	id, ok := requestAgentTaskIdentity(r)
+	if !ok {
 		return db.AgentTaskQueue{}, false
 	}
-	taskUUID, err := util.ParseUUID(taskIDHeader)
+	taskUUID, err := util.ParseUUID(id.TaskID)
 	if err != nil {
 		return db.AgentTaskQueue{}, false
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-	if err != nil {
+	if err != nil || uuidToString(task.AgentID) != id.AgentID {
 		return db.AgentTaskQueue{}, false
 	}
 	return task, true

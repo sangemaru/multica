@@ -282,8 +282,7 @@ func TestCreateComment_SquadLeaderSelfMentionCompletedTaskDoesNotFakeSuccess(t *
 	w := httptest.NewRecorder()
 	r := withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{"content": content}), "id", issueID)
 	// Author the comment AS the leader agent (A2A self-mention).
-	r.Header.Set("X-Agent-ID", leaderID)
-	r.Header.Set("X-Task-ID", completedTaskID)
+	r = withAgentTaskIdentity(r, leaderID, completedTaskID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())

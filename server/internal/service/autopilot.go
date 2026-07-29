@@ -13,10 +13,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/admission"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/dispatch"
 	"github.com/multica-ai/multica/server/internal/events"
+	requestidentity "github.com/multica-ai/multica/server/internal/identity"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/issueposition"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -906,6 +908,31 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		return &errDispatchSkipped{reason: formatAdmissionReason(ap, "workspace fail-closed: no accountable human for autopilot run"), code: dispatch.ReasonAttributionBlocked}
 	}
 	apSource, _, apEvidenceKind, apEvidenceRef := attributionCreateParams(autopilotAttr)
+	admissionIdentity := requestidentity.RequestIdentity{}
+	if id, ok := requestidentity.FromContext(ctx); ok {
+		admissionIdentity = id
+	} else {
+		admissionIdentity = requestidentity.RequestIdentity{
+			PrincipalType:   requestidentity.PrincipalAutopilot,
+			PrincipalID:     util.UUIDToString(ap.ID),
+			CredentialClass: requestidentity.CredentialAutopilotTrigger,
+			WorkspaceID:     util.UUIDToString(ap.WorkspaceID),
+		}
+	}
+	decision, err := s.TaskSvc.AdmitTask(ctx, admission.Request{
+		Path:        admission.PathAutopilot,
+		Identity:    admissionIdentity,
+		WorkspaceID: util.UUIDToString(ap.WorkspaceID),
+		ProjectID:   util.UUIDToString(ap.ProjectID),
+		AgentID:     util.UUIDToString(agent.ID),
+	})
+	if err != nil {
+		return &errDispatchSkipped{reason: formatAdmissionReason(ap, "authorization denied"), code: dispatch.ReasonInvocationNotAllowed}
+	}
+	authorization, err := metadataFromAdmission(decision)
+	if err != nil {
+		return fmt.Errorf("autopilot admission metadata: %w", err)
+	}
 	task, err := s.Queries.CreateAutopilotTask(ctx, db.CreateAutopilotTaskParams{
 		AgentID:        agent.ID,
 		RuntimeID:      agent.RuntimeID,
@@ -918,14 +945,19 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 			String: truncateForSummary(ap.Title, triggerSummaryMaxLen),
 			Valid:  ap.Title != "",
 		},
-		OriginatorUserID:     autopilotAttr.UserID,
-		AccountableUserID:    autopilotAttr.AccountableUserID,
-		RuleVersionID:        autopilotAttr.RuleVersionID,
-		OriginatorSource:     apSource,
-		TriggerEvidenceKind:  apEvidenceKind,
-		TriggerEvidenceRefID: apEvidenceRef,
+		OriginatorUserID:           autopilotAttr.UserID,
+		AccountableUserID:          autopilotAttr.AccountableUserID,
+		RuleVersionID:              autopilotAttr.RuleVersionID,
+		OriginatorSource:           apSource,
+		TriggerEvidenceKind:        apEvidenceKind,
+		TriggerEvidenceRefID:       apEvidenceRef,
+		AdmissionDecisionID:        authorization.decisionID,
+		AuthorizationPolicyVersion: authorization.policyVersion,
+		LineageID:                  authorization.lineageID,
+		BudgetReservationID:        authorization.budgetReservationID,
 	})
 	if err != nil {
+		s.TaskSvc.releaseUnboundAdmissionBudget(ctx, authorization, "task_insert_failed")
 		return fmt.Errorf("create autopilot task: %w", err)
 	}
 

@@ -485,6 +485,19 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requested, err := h.TaskService.CancelTasksForChatSession(r.Context(), session.ID)
+	if err != nil {
+		if errors.Is(err, service.ErrTaskTerminationPending) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "task_termination_pending",
+				"error": err.Error(),
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to cancel chat session tasks")
+		return
+	}
+
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to start transaction")
@@ -562,7 +575,11 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 
 	// Post-commit broadcasts. Subscribers should never observe events for a
 	// tx that didn't actually persist.
+	// The preflight service call already emitted lifecycle events. This
+	// transaction only catches pre-start work that raced in before the session
+	// lock; those rows are terminal immediately.
 	h.TaskService.BroadcastCancelledTasks(r.Context(), cancelled)
+	_ = requested
 
 	resolvedSessionID := uuidToString(session.ID)
 	h.publishChat(protocol.EventChatSessionDeleted, workspaceID, "member", userID, resolvedSessionID, protocol.ChatSessionDeletedPayload{

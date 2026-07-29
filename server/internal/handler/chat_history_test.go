@@ -62,14 +62,12 @@ func newChatHistoryTask(t *testing.T, chatSession bool) string {
 	return taskID
 }
 
-// taskActorReq builds a request as the Auth middleware would leave it for a mat_
-// task token: the server-set X-Actor-Source=task_token + the authoritative
-// X-Task-ID. target may carry query params (e.g. "?id=70.0").
-func taskActorReq(target, taskID string) *http.Request {
+// taskActorReq builds a request carrying the typed identity Auth derives from a
+// valid task token. target may carry query params (e.g. "?id=70.0").
+func taskActorReq(t *testing.T, target, taskID string) *http.Request {
+	t.Helper()
 	req := newRequest("GET", target, nil)
-	req.Header.Set("X-Actor-Source", "task_token")
-	req.Header.Set("X-Task-ID", taskID)
-	return req
+	return withAgentTaskIdentity(req, agentIDForHandlerTestTask(t, taskID), taskID)
 }
 
 func withSlackHistory(t *testing.T, r ChatChannelHistoryReader) {
@@ -95,7 +93,7 @@ func TestGetChatChannelHistory_Success(t *testing.T) {
 	withSlackHistory(t, fake)
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatChannelHistory(w, taskActorReq("/api/chat/history?limit=10", taskID))
+	testHandler.GetChatChannelHistory(w, taskActorReq(t, "/api/chat/history?limit=10", taskID))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
@@ -124,7 +122,7 @@ func TestGetChatThread_CurrentThread(t *testing.T) {
 	withSlackHistory(t, fake)
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatThread(w, taskActorReq("/api/chat/thread", taskID))
+	testHandler.GetChatThread(w, taskActorReq(t, "/api/chat/thread", taskID))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
@@ -146,7 +144,7 @@ func TestGetChatThread_ByID(t *testing.T) {
 	withSlackHistory(t, fake)
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatThread(w, taskActorReq("/api/chat/thread?id=70.0", taskID))
+	testHandler.GetChatThread(w, taskActorReq(t, "/api/chat/thread?id=70.0", taskID))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
@@ -164,7 +162,7 @@ func TestGetChatHistory_NoBindingReturnsNote(t *testing.T) {
 	withSlackHistory(t, &fakeChatHistoryReader{err: slack.ErrNoSlackSession})
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatChannelHistory(w, taskActorReq("/api/chat/history", taskID))
+	testHandler.GetChatChannelHistory(w, taskActorReq(t, "/api/chat/history", taskID))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
@@ -184,7 +182,7 @@ func TestGetChatHistory_NilReaderReturnsNote(t *testing.T) {
 	withSlackHistory(t, nil)
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatChannelHistory(w, taskActorReq("/api/chat/history", taskID))
+	testHandler.GetChatChannelHistory(w, taskActorReq(t, "/api/chat/history", taskID))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
@@ -197,8 +195,8 @@ func TestGetChatHistory_NilReaderReturnsNote(t *testing.T) {
 }
 
 // TestGetChatHistory_RejectsForgedTaskID: a normal request (no server-set
-// X-Actor-Source) that forges X-Task-ID — what a member could do with a JWT /
-// mul_ PAT, since the Auth middleware does NOT strip a client-sent X-Task-ID —
+// identity context that forges X-Task-ID — what a member could attempt with a
+// JWT or personal token —
 // must be rejected, never served another session's history.
 func TestGetChatHistory_RejectsForgedTaskID(t *testing.T) {
 	if testHandler == nil {
@@ -209,7 +207,7 @@ func TestGetChatHistory_RejectsForgedTaskID(t *testing.T) {
 	withSlackHistory(t, fake)
 
 	req := newRequest("GET", "/api/chat/history", nil)
-	req.Header.Set("X-Task-ID", taskID) // forged: no X-Actor-Source=task_token
+	req.Header.Set("X-Task-ID", taskID)
 	w := httptest.NewRecorder()
 	testHandler.GetChatChannelHistory(w, req)
 
@@ -221,17 +219,17 @@ func TestGetChatHistory_RejectsForgedTaskID(t *testing.T) {
 	}
 }
 
-func TestGetChatHistory_MissingTaskHeader(t *testing.T) {
+func TestGetChatHistory_MissingTaskIdentity(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("requires test database")
 	}
-	// Task-token actor source but no X-Task-ID: a defensive 400.
+	// A forged legacy marker without typed task identity is rejected.
 	req := newRequest("GET", "/api/chat/history", nil)
 	req.Header.Set("X-Actor-Source", "task_token")
 	w := httptest.NewRecorder()
 	testHandler.GetChatChannelHistory(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
 	}
 }
 
@@ -243,7 +241,7 @@ func TestGetChatHistory_NonChatTask(t *testing.T) {
 	withSlackHistory(t, &fakeChatHistoryReader{})
 
 	w := httptest.NewRecorder()
-	testHandler.GetChatChannelHistory(w, taskActorReq("/api/chat/history", taskID))
+	testHandler.GetChatChannelHistory(w, taskActorReq(t, "/api/chat/history", taskID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
 	}

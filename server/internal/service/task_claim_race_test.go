@@ -211,12 +211,15 @@ func createClaimCapacityFixture(t *testing.T, ctx context.Context, pool *pgxpool
 		`, workspaceID, fmt.Sprintf("claim capacity issue %d", i+1), userID, 900000+i, i).Scan(&issueID); err != nil {
 			t.Fatalf("create issue %d: %v", i+1, err)
 		}
-		if _, err := pool.Exec(ctx, `
+		var taskID string
+		if err := pool.QueryRow(ctx, `
 			INSERT INTO agent_task_queue (agent_id, issue_id, status, priority, context, runtime_id)
 			VALUES ($1, $2, 'queued', 0, '{}'::jsonb, $3)
-		`, agentID, issueID, runtimeID); err != nil {
+			RETURNING id
+		`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
 			t.Fatalf("create task %d: %v", i+1, err)
 		}
+		authorizeTaskForClaim(t, pool, taskID)
 	}
 
 	return agentID

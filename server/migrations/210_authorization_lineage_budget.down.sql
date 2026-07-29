@@ -1,0 +1,13 @@
+DROP TRIGGER IF EXISTS agent_task_authorization_metadata_immutable ON agent_task_queue;
+DROP FUNCTION IF EXISTS prevent_task_authorization_metadata_mutation();
+DROP TRIGGER IF EXISTS agent_task_reconcile_authorization_budget ON agent_task_queue;
+DROP FUNCTION IF EXISTS reconcile_authorization_budget_for_task();
+DROP TRIGGER IF EXISTS agent_task_bind_authorization_budget ON agent_task_queue;
+DROP FUNCTION IF EXISTS bind_authorization_budget_reservation();
+DROP INDEX IF EXISTS agent_task_queue_budget_reservation_idx;
+ALTER TABLE agent_task_queue DROP COLUMN IF EXISTS budget_reservation_id;
+DROP TRIGGER IF EXISTS authorization_budget_event_append_only ON authorization_budget_event;
+DROP FUNCTION IF EXISTS prevent_authorization_budget_event_mutation();
+DROP TABLE IF EXISTS authorization_budget_event;
+DROP TABLE IF EXISTS authorization_budget_reservation;
+DROP TABLE IF EXISTS authorization_lineage_budget;

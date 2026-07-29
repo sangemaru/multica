@@ -393,8 +393,7 @@ func TestChildDone_SquadPrivateLeader_AgentActorWakesLeader(t *testing.T) {
 	r = newRequest("PATCH", "/api/issues/"+child.ID, map[string]any{
 		"status": "done",
 	})
-	r.Header.Set("X-Agent-ID", workerAgentID)
-	r.Header.Set("X-Task-ID", workerTaskID)
+	r = withAgentTaskIdentity(r, workerAgentID, workerTaskID)
 	r = withURLParam(r, "id", child.ID)
 	testHandler.UpdateIssue(w, r)
 	if w.Code != http.StatusOK {
@@ -473,8 +472,7 @@ func TestComment_SquadPrivateLeader_AgentActorAllowed(t *testing.T) {
 	r := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "[@Squad](mention://squad/" + squadID + ") agent reporting in",
 	})
-	r.Header.Set("X-Agent-ID", otherAgentID)
-	r.Header.Set("X-Task-ID", taskID)
+	r = withAgentTaskIdentity(r, otherAgentID, taskID)
 	r = withURLParam(r, "id", issueID)
 	testHandler.CreateComment(w, r)
 	if w.Code != http.StatusCreated {
