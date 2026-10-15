@@ -2751,6 +2751,10 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			}
 		}
 		projectCtx.applyTo(&resp)
+		resp.HybridProjectContext, resp.ProjectDescription = claimProjectContextMode(issue.Metadata, resp.ProjectDescription)
+		// This optional observation uses only explicit short-comment selectors.
+		// Missing, stale or inaccessible sources degrade context, not task delivery.
+		resp.PreparedProjectContext = prepareClaimProjectContext(r.Context(), h.Queries, task.ID, task.AgentID, runtime.WorkspaceID, issue, time.Now())
 
 		// Load every planned input as one chronological, de-duplicated set.
 		// The trigger is included here so the delivery receipt can only contain

@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
@@ -70,6 +71,7 @@ func perTurnContextBlocks(task Task, opts promptOpts) string {
 	b.WriteString(execenv.BuildOnBehalfOfBlock(task.InitiatorName, task.InitiatorEmail))
 	b.WriteString(execenv.BuildConnectedAppsBlock(task.ConnectedApps))
 	b.WriteString(buildJoinedWakeupsBlock(task.WakeupJoined))
+	b.WriteString(buildHybridContextBlock(task, time.Now()))
 	return b.String()
 }
 

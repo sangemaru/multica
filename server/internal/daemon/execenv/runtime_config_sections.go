@@ -495,7 +495,7 @@ func writeProjectContext(b *strings.Builder, ctx TaskContextForEnv) {
 	if ctx.ProjectTitle != "" {
 		fmt.Fprintf(b, "The active project for this task is **%s**.\n\n", ctx.ProjectTitle)
 	}
-	if desc := strings.TrimSpace(ctx.ProjectDescription); desc != "" {
+	if desc := strings.TrimSpace(projectDescriptionForEnv(ctx)); desc != "" {
 		b.WriteString("Project description — durable context the project owner set for work in this project:\n\n")
 		b.WriteString(desc)
 		b.WriteString("\n\n")

@@ -244,6 +244,15 @@ type projectResourceFile struct {
 	Resources          []ProjectResourceForEnv `json:"resources"`
 }
 
+// One privacy rule for both the runtime brief and resources sidecar. It must
+// not depend on a selected snapshot being present, valid, or unexpired.
+func projectDescriptionForEnv(ctx TaskContextForEnv) string {
+	if ctx.HybridProjectContext {
+		return ""
+	}
+	return ctx.ProjectDescription
+}
+
 // MarshalJSON renders the resource_ref field as raw JSON instead of a base64
 // blob. The struct's other fields are simple strings.
 func (p ProjectResourceForEnv) MarshalJSON() ([]byte, error) {
@@ -288,7 +297,7 @@ func writeProjectResources(workDir string, ctx TaskContextForEnv, manifest *side
 	payload := projectResourceFile{
 		ProjectID:          ctx.ProjectID,
 		ProjectTitle:       ctx.ProjectTitle,
-		ProjectDescription: ctx.ProjectDescription,
+		ProjectDescription: projectDescriptionForEnv(ctx),
 		Resources:          resources,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
@@ -296,6 +305,9 @@ func writeProjectResources(workDir string, ctx TaskContextForEnv, manifest *side
 		return err
 	}
 	if err := recordWriteFile(filepath.Join(dir, "resources.json"), data, 0o644, manifest); err != nil {
+		if ctx.HybridProjectContext {
+			return fmt.Errorf("hybrid context gap: project resources could not be safely refreshed: %w", err)
+		}
 		// .multica/project/resources.json is Multica-owned and a
 		// pre-existing path is almost certainly user content the
 		// manifest must not destroy. The runtime brief already lists

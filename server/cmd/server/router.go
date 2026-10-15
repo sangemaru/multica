@@ -1986,6 +1986,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Use(middleware.RequireWorkspaceMember(queries))
 
 			// Assignee frequency
+			r.Get("/api/context/refresh", h.RefreshTaskProjectContext)
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
 			// Local search index sync for Web/Desktop (MUL-7754). Human clients

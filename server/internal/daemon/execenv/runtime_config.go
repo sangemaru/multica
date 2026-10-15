@@ -186,6 +186,15 @@ func InjectRuntimeConfig(workDir, provider string, ctx TaskContextForEnv) (strin
 		// Unknown provider — skip config injection, prompt-only mode.
 		return content, nil
 	}
+	if ctx.HybridProjectContext {
+		existing, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return content, fmt.Errorf("hybrid context gap: runtime brief cannot be inspected: %w", err)
+		}
+		if strings.Count(string(existing), runtimeMarkerBegin) > 1 {
+			return content, fmt.Errorf("hybrid context gap: multiple managed runtime blocks require review")
+		}
+	}
 	return content, writeRuntimeConfigFile(path, content)
 }
 

@@ -7670,6 +7670,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err := validateTaskIdentity(task); err != nil {
 		return TaskResult{}, err
 	}
+	if err := validateHybridTaskBinding(task); err != nil {
+		return TaskResult{}, err
+	}
+	var maintenance *agent.CodexMaintenancePolicy
+	var maintenanceErr error
+	task, maintenance, maintenanceErr = maintenanceTaskInputs(task, provider)
+	if maintenanceErr != nil {
+		return TaskResult{}, maintenanceErr
+	}
 
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
@@ -7750,12 +7759,19 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if !ok {
 		return TaskResult{}, fmt.Errorf("no agent configured for provider %q", provider)
 	}
+	if maintenance != nil {
+		if err := maintenance.ValidateRuntime(runtime.GOOS, resolvedVersion, entry.Path, !usesCustomProfileCommand, profileFixedArgs, defaultArgsForProvider(d.cfg, provider), nil); err != nil {
+			return TaskResult{}, err
+		}
+	}
 
 	stopPrepareLease := d.startTaskPrepareLeaseExtender(prepareCtx, task, taskLog)
 	defer stopPrepareLease()
 
-	if err := d.ensureTaskSkillBundles(prepareCtx, &task); err != nil {
-		return TaskResult{}, err
+	if maintenance == nil {
+		if err := d.ensureTaskSkillBundles(prepareCtx, &task); err != nil {
+			return TaskResult{}, err
+		}
 	}
 	phaseRecorder.Mark(taskPhaseSkillsReady)
 
@@ -7791,6 +7807,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		ProjectID:                        task.ProjectID,
 		ProjectTitle:                     task.ProjectTitle,
 		ProjectDescription:               task.ProjectDescription,
+		HybridProjectContext:             task.HybridProjectContext,
 		ProjectResources:                 convertProjectResourcesForEnv(task.ProjectResources),
 		ChatSessionID:                    task.ChatSessionID,
 		ChatChannelType:                  task.ChatChannelType,
@@ -7879,50 +7896,57 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var agentMcpConfig json.RawMessage
 	var effectiveMcpConfig json.RawMessage
 	var cursorMcpAuthSource string
-	remoteMCPConfig, remoteMCPDiagnostics, remoteMCPBrokers, remoteMCPErr := startTaskRemoteMCPBrokers(
-		prepareCtx, ctx, task.ID, provider, task.RemoteMCPConnections,
-		func(resolveCtx context.Context, contributionID string) (http.Header, error) {
-			return d.client.ResolveRemoteMCPCredential(resolveCtx, task.RemoteMCPDaemonToken, task.ID, contributionID)
-		},
-		taskLog,
-	)
-	if remoteMCPErr != nil {
-		return TaskResult{}, fmt.Errorf("prepare Remote MCP broker: %w", remoteMCPErr)
-	}
-	if remoteMCPBrokers != nil {
-		defer remoteMCPBrokers.Close()
-	}
-	for _, diagnostic := range remoteMCPDiagnostics {
-		taskLog.Warn("Remote MCP degraded", "reason", diagnostic)
-	}
+	var remoteMCPConfig json.RawMessage
+	if maintenance == nil {
+		resolvedRemoteMCPConfig, remoteMCPDiagnostics, remoteMCPBrokers, remoteMCPErr := startTaskRemoteMCPBrokers(
+			prepareCtx, ctx, task.ID, provider, task.RemoteMCPConnections,
+			func(resolveCtx context.Context, contributionID string) (http.Header, error) {
+				return d.client.ResolveRemoteMCPCredential(resolveCtx, task.RemoteMCPDaemonToken, task.ID, contributionID)
+			},
+			taskLog,
+		)
+		remoteMCPConfig = resolvedRemoteMCPConfig
+		if remoteMCPErr != nil {
+			return TaskResult{}, fmt.Errorf("prepare Remote MCP broker: %w", remoteMCPErr)
+		}
+		if remoteMCPBrokers != nil {
+			defer remoteMCPBrokers.Close()
+		}
+		for _, diagnostic := range remoteMCPDiagnostics {
+			taskLog.Warn("Remote MCP degraded", "reason", diagnostic)
+		}
 
-	// Agent-trigger plugin hooks, as a second local MCP server beside the
-	// broker. A failure to start it degrades to no plugin tools rather than
-	// failing the task: an agent that cannot reach a plugin should still work
-	// on the issue, which is the same rule that makes a failing tool call a
-	// tool error rather than a task error.
-	pluginHookConfig, pluginHookServer, pluginHookErr := startTaskPluginHookMCP(
-		ctx, task.ID, task.PluginHookTools,
-		func(callCtx context.Context, taskID, installationID, hookKey string, input json.RawMessage) (json.RawMessage, error) {
-			return d.client.InvokeAgentPluginHook(callCtx, task.RemoteMCPDaemonToken, taskID, installationID, hookKey, input)
-		},
-		taskLog,
-	)
-	if pluginHookErr != nil {
-		taskLog.Warn("plugin hook tools unavailable", "error", pluginHookErr)
-	}
-	if pluginHookServer != nil {
-		defer pluginHookServer.Close()
-	}
-	if len(pluginHookConfig) > 0 {
-		merged, mergeErr := mergeTaskRemoteMCPConfig(remoteMCPConfig, pluginHookConfig)
-		if mergeErr != nil {
-			taskLog.Warn("could not merge plugin hook MCP config", "error", mergeErr)
-		} else {
-			remoteMCPConfig = merged
+		// Agent-trigger plugin hooks, as a second local MCP server beside the
+		// broker. A failure to start it degrades to no plugin tools rather than
+		// failing the task: an agent that cannot reach a plugin should still work
+		// on the issue, which is the same rule that makes a failing tool call a
+		// tool error rather than a task error.
+		pluginHookConfig, pluginHookServer, pluginHookErr := startTaskPluginHookMCP(
+			ctx, task.ID, task.PluginHookTools,
+			func(callCtx context.Context, taskID, installationID, hookKey string, input json.RawMessage) (json.RawMessage, error) {
+				return d.client.InvokeAgentPluginHook(callCtx, task.RemoteMCPDaemonToken, taskID, installationID, hookKey, input)
+			},
+			taskLog,
+		)
+		if pluginHookErr != nil {
+			taskLog.Warn("plugin hook tools unavailable", "error", pluginHookErr)
+		}
+		if pluginHookServer != nil {
+			defer pluginHookServer.Close()
+		}
+		if len(pluginHookConfig) > 0 {
+			merged, mergeErr := mergeTaskRemoteMCPConfig(remoteMCPConfig, pluginHookConfig)
+			if mergeErr != nil {
+				taskLog.Warn("could not merge plugin hook MCP config", "error", mergeErr)
+			} else {
+				remoteMCPConfig = merged
+			}
 		}
 	}
-	if task.Agent != nil {
+	if maintenance != nil {
+		effectiveMcpConfig = json.RawMessage(`{}`)
+	}
+	if task.Agent != nil && maintenance == nil {
 		agentMcpConfig = task.Agent.McpConfig
 		effectiveMcpConfig = agentMcpConfig
 		if merged, mergeErr := mergeRuntimeAndAgentMcpConfig(provider, agentMcpConfig); mergeErr != nil {
@@ -8061,14 +8085,21 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// task, starting before Prepare/Reuse mounts it — so a prune that samples the
 	// store's stale (pre-remount) mtime cannot reclaim it out from under a resume
 	// of a long-idle issue (MUL-4424). No-op for non-Codex tasks / no stable key.
-	if provider == "codex" {
+	if provider == "codex" && maintenance == nil {
 		if store := execenv.CodexSessionStorePath(d.cfg.Profile, taskCtx); store != "" {
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
 		}
 	}
 	envReused := false
-	priorClaim, priorWorkDir, lockedPriorInfo, reusable, reuseErr := d.lockReusablePriorEnvRoot(ctx, task, localAssignment, envClaim.RootDir())
+	var priorClaim *execenv.EnvRootClaim
+	var priorWorkDir string
+	var lockedPriorInfo os.FileInfo
+	var reusable bool
+	var reuseErr error
+	if maintenance == nil {
+		priorClaim, priorWorkDir, lockedPriorInfo, reusable, reuseErr = d.lockReusablePriorEnvRoot(ctx, task, localAssignment, envClaim.RootDir())
+	}
 	if reuseErr != nil {
 		// Cancelled while waiting for the previous run to let go of its
 		// directory. Ending here IS the behaviour: falling through would
@@ -8129,6 +8160,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// Whether it did decides whether an env-root-scoped session store — the
 		// Hermes overlay's task-local state.db — carried over from the prior task.
 		envReused = env != nil
+		if task.HybridProjectContext && env == nil {
+			return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("hybrid context gap: prior environment could not be safely refreshed; fresh-session review required"))
+		}
 	}
 	if env == nil {
 		var err error
@@ -8158,6 +8192,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
 		}
+		prepParams = maintenancePrepareParams(prepParams, maintenance, entry.Path, agentEnvOverrides)
 		if localAssignment.UsesWorktree() {
 			prepParams.LocalWorktree = &execenv.LocalWorktreeParams{LocalPath: localAssignment.AbsPath}
 			// Take the per-path mutex for the snapshot alone, then hand it
@@ -8394,13 +8429,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// "start task failed: <…>" string and the same failure_reason
 	// taxonomy as before — see MUL-2946 for the classifier contract.
 	var taskCapabilities []string
-	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
+	if maintenance == nil && agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
 	taskSupplementNegotiated, err := d.client.StartTask(prepareCtx, task, taskCapabilities...)
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
+	}
+	if maintenance != nil {
+		taskSupplementNegotiated = false
 	}
 	if taskSupplementNegotiated {
 		// Register before provider launch so a hint cannot arrive in the gap
@@ -8435,9 +8473,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
-	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
-	if err != nil {
-		d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
+	var runtimeBrief string
+	if maintenance == nil {
+		runtimeBrief, err = execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
+		if err != nil {
+			if task.HybridProjectContext {
+				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("hybrid context gap: runtime brief could not be safely refreshed: %w", err))
+			}
+			d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
+		}
 	}
 	// An exempt turn runs in the user's directory without having queued for it,
 	// so a sibling coding task may be writing to the same tree right now. That
@@ -8454,7 +8498,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env.LocalWorktree != nil && len(env.LocalWorktree.ReplayConflicts) > 0 {
 		promptOptions = append(promptOptions, WithWorktreeReplayConflicts(env.LocalWorktree.ReplayConflicts))
 	}
-	prompt := BuildPrompt(task, provider, promptOptions...)
+	var prompt string
+	if maintenance != nil {
+		prompt = maintenance.Prompt
+	} else {
+		prompt = BuildPrompt(task, provider, promptOptions...)
+	}
 
 	// Pass task-scoped auth credentials and context so the spawned agent CLI
 	// can call the Multica API and the local daemon (e.g. `multica repo checkout`).
@@ -8562,8 +8611,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentEnv["MULTICA_DSH_SESSION_ROOT"] = dshSessionRoot
 		agentEnv["DSH_TELEMETRY_DISABLED"] = "1"
 	}
-	if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
-		return TaskResult{}, err
+	if maintenance == nil {
+		if err := configureCodexTaskShellEnvironment(provider, env.CodexHome, os.Environ(), agentEnv, agentCustomEnv, d.logger); err != nil {
+			return TaskResult{}, err
+		}
+	} else {
+		agentEnv = env.CodexMaintenanceEnv
 	}
 	// The overlay is authoritative once built, so nothing on the command line
 	// may re-point HERMES_HOME out of it. Both argv regions are stripped
@@ -8586,16 +8639,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// daemon never calls agent.New or agent.NewRuntime directly, so the two
 	// factories stay meaning exactly one thing each.
 	backend, err := agent.ResolveBackend(provider, agent.Config{
-		ExecutablePath: entry.Path,
-		LaunchPrefix:   profileFixedArgs,
-		CLIVersion:     resolvedVersion,
-		Env:            agentEnv,
-		Logger:         d.logger,
-		TaskID:         task.ID,
-		RuntimeID:      task.RuntimeID,
-		DaemonVersion:  d.cfg.CLIVersion,
-		CodexVersion:   codexVersion,
-		BuiltinRuntime: !usesCustomProfileCommand,
+		CodexMaintenance: maintenance,
+		ExecutablePath:   entry.Path,
+		LaunchPrefix:     profileFixedArgs,
+		CLIVersion:       resolvedVersion,
+		Env:              agentEnv,
+		Logger:           d.logger,
+		TaskID:           task.ID,
+		RuntimeID:        task.RuntimeID,
+		DaemonVersion:    d.cfg.CLIVersion,
+		CodexVersion:     codexVersion,
+		BuiltinRuntime:   !usesCustomProfileCommand,
 	})
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("create agent backend: %w", err)
@@ -8658,9 +8712,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		thinkingLevel = task.Agent.ThinkingLevel
 		serviceTier = task.Agent.ServiceTier
 	}
-	selection := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
-		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
-	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
+	if maintenance == nil {
+		selection := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
+			taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
+		model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
+	} else {
+		model, thinkingLevel, serviceTier = maintenance.Model, "", ""
+	}
 
 	var idleWatchdogTimeout time.Duration
 	if provider == "opencode" || provider == "codearts" {
@@ -8701,6 +8759,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
 	}
+	execOpts = maintenanceExecOptions(execOpts, maintenance)
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:
 	//   - openclaw is pinned to the task workdir via the per-task config we
@@ -8786,7 +8845,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var retiredSessionID string
 	defer func() { taskResult.RetiredSessionID = retiredSessionID }()
 
-	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
+	if maintenance == nil && shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
@@ -8819,6 +8878,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		execOpts.ResumeContinuityNotice = ""
 		taskCtx.PriorSessionResumed = false
 		if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
+			if task.HybridProjectContext {
+				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("hybrid context gap: retry runtime brief could not be safely refreshed: %w", briefErr))
+			}
 			taskLog.Warn("execenv: re-inject cold runtime config for fresh retry failed (non-fatal)", "error", briefErr)
 		} else {
 			runtimeBrief = freshBrief

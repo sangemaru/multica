@@ -564,6 +564,10 @@ type AgentTaskResponse struct {
 	// owning user; the daemon must not fall back to its own credential. See
 	// MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+
+	// Optional bounded source observation; never a source of action authority.
+	PreparedProjectContext *protocol.PreparedProjectContext `json:"prepared_project_context,omitempty"`
+	HybridProjectContext   bool                             `json:"hybrid_project_context,omitempty"`
 }
 
 // TaskAttribution is the wire shape of a run's accountable-human provenance

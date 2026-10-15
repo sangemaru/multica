@@ -933,6 +933,9 @@ func isCodexBareTomlKey(s string) bool {
 }
 
 func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	if err := b.validateMaintenanceExecution(prompt, opts); err != nil {
+		return nil, err
+	}
 	firstSession, err := b.executeOnce(ctx, prompt, opts, 1)
 	if err != nil {
 		return nil, err
@@ -1018,7 +1021,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			case result.codexStartupRefreshRetrySafe:
 				retryReason = "model_catalog_refresh"
 			}
-			if retryReason == "" || attempt == 2 {
+			if retryReason == "" || attempt == 2 || b.cfg.CodexMaintenance != nil {
 				flushHeldPins()
 				resCh <- result
 				return
@@ -1055,7 +1058,12 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Supplement: supplement, SupplementReady: supplementReady, Messages: msgCh, Result: resCh}, nil
+	session := &Session{Supplement: supplement, SupplementReady: supplementReady, Messages: msgCh, Result: resCh}
+	if b.cfg.CodexMaintenance != nil {
+		session.Supplement = nil
+		session.SupplementReady = nil
+	}
+	return session, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1085,7 +1093,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// Writing through config.toml at 0o600 keeps the secret values out of argv
 	// entirely.
 	codexHome := strings.TrimSpace(b.cfg.Env["CODEX_HOME"])
-	if codexHome != "" {
+	if codexHome != "" && b.cfg.CodexMaintenance == nil {
 		if err := ensureCodexMcpConfig(filepath.Join(codexHome, "config.toml"), opts.McpConfig, b.cfg.Logger); err != nil {
 			// Fail closed when we can't materialise the managed config.
 			// Warning-and-launching would silently fall back to the
@@ -1096,7 +1104,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			cancel()
 			return nil, fmt.Errorf("apply codex mcp_config: %w", err)
 		}
-	} else if hasManagedCodexMcpConfig(opts.McpConfig) {
+	} else if b.cfg.CodexMaintenance == nil && hasManagedCodexMcpConfig(opts.McpConfig) {
 		// Managed mcp_config saved but no CODEX_HOME to anchor it.
 		// Same reasoning as above: silently launching would inherit
 		// whatever MCP setup the host user has, which is the wrong
@@ -1170,7 +1178,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
-	cmd.Env = buildEnv(b.cfg.Env)
+	if b.cfg.CodexMaintenance != nil {
+		cmd.Env = maintenanceEnvironmentList(b.cfg.Env)
+	} else {
+		cmd.Env = buildEnv(b.cfg.Env)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1632,6 +1644,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// must not drift independently).
 		applyCodexReasoningEffort(turnParams, opts.ThinkingLevel)
 		applyCodexServiceTier(turnParams, opts.ServiceTier)
+		applyCodexMaintenancePermissions(turnParams, b.cfg.CodexMaintenance, false)
 		waitingForTurn := true
 		var timeoutDiagnostic codexTimeoutDiagnostic
 		var processExitErr error
@@ -2010,6 +2023,9 @@ func codexTurnInput(prompt string, resumeExpected, resumed bool, notice string) 
 // turn/start calls must reference, and resumed indicates whether the prior
 // thread was picked up (only useful for logging).
 func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions, logger *slog.Logger) (string, bool, error) {
+	if c.cfg.CodexMaintenance != nil && (opts.ResumeSessionID != "" || opts.ResumeExpected) {
+		return "", false, fmt.Errorf("maintenance: thread resume is unsupported")
+	}
 	if priorThreadID := opts.ResumeSessionID; priorThreadID != "" {
 		// thread/resume reuses the thread's persisted model and reasoning
 		// effort; only override fields the daemon actually cares about.
@@ -2088,6 +2104,7 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 	}
 	applyCodexReasoningEffort(startParams, opts.ThinkingLevel)
 	applyCodexServiceTier(startParams, opts.ServiceTier)
+	applyCodexMaintenancePermissions(startParams, c.cfg.CodexMaintenance, true)
 	c.threadSetupMethod = "thread/start"
 	c.threadSetupStarted = time.Now()
 	logger.Info("codex lifecycle",
@@ -2924,6 +2941,18 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 
 	var method string
 	_ = json.Unmarshal(raw["method"], &method)
+
+	if c.cfg.CodexMaintenance != nil {
+		switch method {
+		case "item/commandExecution/requestApproval", "execCommandApproval", "item/fileChange/requestApproval", "applyPatchApproval":
+			c.respond(id, map[string]any{"decision": "decline"})
+		case "item/permissions/requestApproval":
+			c.respond(id, map[string]any{"permissions": map[string]any{}, "scope": "turn"})
+		default:
+			c.respondError(id, -32601, "maintenance: tool approvals are disabled")
+		}
+		return
+	}
 
 	// Auto-approve all exec/patch requests in daemon mode
 	switch method {

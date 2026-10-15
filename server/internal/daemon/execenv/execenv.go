@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 // RepoContextForEnv describes a workspace repo available for checkout.
@@ -37,12 +38,15 @@ type ProjectResourceForEnv struct {
 
 // PrepareParams holds all inputs needed to set up an execution environment.
 type PrepareParams struct {
-	WorkspacesRoot  string // base path for all envs (e.g., ~/multica_workspaces)
-	WorkspaceID     string // workspace UUID — stable identity and path suffix
-	WorkspaceSlug   string // human-readable workspace path prefix
-	TaskID          string // task UUID — stable identity and path suffix
-	IssueIdentifier string // human-readable issue key (e.g. MUL-6063); empty for non-issue tasks
-	AgentName       string // for git branch naming only
+	CodexMaintenance            *agent.CodexMaintenancePolicy
+	CodexMaintenanceProviderEnv map[string]string
+	CodexExecutable             string
+	WorkspacesRoot              string // base path for all envs (e.g., ~/multica_workspaces)
+	WorkspaceID                 string // workspace UUID — stable identity and path suffix
+	WorkspaceSlug               string // human-readable workspace path prefix
+	TaskID                      string // task UUID — stable identity and path suffix
+	IssueIdentifier             string // human-readable issue key (e.g. MUL-6063); empty for non-issue tasks
+	AgentName                   string // for git branch naming only
 	// EnvRootPreclaimed says the CALLER already holds this env root's claim
 	// (see ClaimEnvRoot) and has already reset it. Prepare then skips claiming.
 	//
@@ -233,6 +237,9 @@ type TaskContextForEnv struct {
 	InitiatorID    string
 	InitiatorName  string
 	InitiatorEmail string
+
+	// Issue-task privacy mode, independently of selected-source availability.
+	HybridProjectContext bool
 }
 
 // SkillContextForEnv represents a skill to be written into the execution environment.
@@ -289,7 +296,8 @@ type Environment struct {
 	// branch name to report as the task's result.
 	LocalWorktree *LocalWorktree
 	// CodexHome is the path to the per-task CODEX_HOME directory (set only for codex provider).
-	CodexHome string
+	CodexHome           string
+	CodexMaintenanceEnv map[string]string
 	// ClaudeSettingsPath is a task-local --settings JSON file that applies
 	// disabled runtime-skill policy without mutating the user's Claude config.
 	ClaudeSettingsPath string
@@ -407,6 +415,20 @@ func readablePathSegment(label, fallback, id string) string {
 // The workdir starts empty (no repo checkouts). The agent checks out repos
 // on demand via `multica repo checkout <url>`.
 func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
+	if params.CodexMaintenance != nil {
+		if params.Provider != "codex" || params.LocalWorkDir != "" || params.LocalWorktree != nil {
+			return nil, fmt.Errorf("maintenance: requires a fresh built-in Codex workdir")
+		}
+		if err := params.CodexMaintenance.ValidateRuntime(runtimeGOOS, params.CodexVersion, params.CodexExecutable, true, nil, nil, params.CodexCustomArgs); err != nil {
+			return nil, err
+		}
+		if _, err := params.CodexMaintenance.Environment("unused", params.CodexMaintenanceProviderEnv); err != nil {
+			return nil, err
+		}
+		// Inherited task context is never hydrated, even when callers supplied
+		// skills, repositories, instructions or resources in PrepareParams.
+		params.Task = TaskContextForEnv{}
+	}
 	if params.WorkspacesRoot == "" {
 		return nil, fmt.Errorf("execenv: workspaces root is required")
 	}
@@ -558,6 +580,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		MulticaConfigRoot: multicaConfigRoot,
 		logger:            logger,
 		lockFile:          lockFile,
+	}
+	if params.CodexMaintenance != nil {
+		if err := prepareCodexMaintenanceHome(env, params); err != nil {
+			return nil, err
+		}
+		prepareSucceeded = true
+		lockClaimed = false
+		return env, nil
 	}
 
 	// Write context files into workdir (skills go to provider-native paths).
@@ -900,6 +930,9 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	manifest := &sidecarManifest{}
 	if err := writeContextFiles(params.WorkDir, params.Provider, params.Task, manifest); err != nil {
 		logger.Warn("execenv: refresh context files failed", "error", err)
+		if params.Task.HybridProjectContext {
+			return nil
+		}
 	}
 	if err := prepareOmpMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
 		logger.Warn("execenv: refresh omp mcp config failed; forcing fresh prepare", "error", err)
